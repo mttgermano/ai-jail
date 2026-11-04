@@ -478,7 +478,8 @@ fn fetch_onepassword(
 /// resolve with a filtered list query.
 fn is_connect_id(s: &str) -> bool {
     s.len() == 26
-        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// Pick the single `id` out of a filtered-list response (a JSON
@@ -716,7 +717,7 @@ fn connect(
 fn load_ca_pem(
     path: &Path,
 ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
-    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
     // The rustls PEM reader iterates every certificate block and
     // handles LF and CRLF line endings; hand-rolling the split here
     // dropped every certificate after the first in a CRLF file.
@@ -727,10 +728,7 @@ fn load_ca_pem(
             format!("cannot parse PEM certificate in {}", path.display())
         })?;
     if ders.is_empty() {
-        return Err(format!(
-            "no PEM certificates found in {}",
-            path.display()
-        ));
+        return Err(format!("no PEM certificates found in {}", path.display()));
     }
     Ok(ders)
 }
@@ -1128,10 +1126,8 @@ mod tests {
         ))
         .unwrap();
         let crlf = fixture.replace("\r\n", "\n").replace('\n', "\r\n");
-        let dir = std::env::temp_dir().join(format!(
-            "ai-jail-ca-crlf-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-ca-crlf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ca-crlf.pem");
 
