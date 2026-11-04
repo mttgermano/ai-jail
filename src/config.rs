@@ -1797,14 +1797,29 @@ pub fn save_global(config: &Config) -> Result<(), String> {
 }
 
 fn save_global_to_path(path: &Path, config: &Config) -> Result<(), String> {
-    let mut global = load_global_from_path(path)?;
-    if config.no_status_bar.is_some() {
-        global.base.no_status_bar = config.no_status_bar;
+    // Fail closed on a malformed trusted config, exactly like load.
+    load_global_from_path(path)?;
+    // Touch ONLY the preference keys in the raw TOML document.
+    // Re-serializing the parsed config here would silently drop every
+    // never-serialized trusted field (env_pass, env_from_file,
+    // secret_hosts, the secret-provider type/url/ca/refs) — values that
+    // exist only in this file and that the user did not ask to change.
+    let mut doc = match std::fs::read_to_string(path) {
+        Ok(raw) => raw
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?,
+        Err(_) if !path.exists() => toml_edit::DocumentMut::new(),
+        Err(e) => {
+            return Err(format!("Failed to read {}: {e}", path.display()));
+        }
+    };
+    if let Some(v) = config.no_status_bar {
+        doc["no_status_bar"] = toml_edit::value(v);
     }
-    if config.status_bar_style.is_some() {
-        global.base.status_bar_style = config.status_bar_style.clone();
+    if let Some(v) = &config.status_bar_style {
+        doc["status_bar_style"] = toml_edit::value(v.clone());
     }
-    save_global_doc_to_path(path, &global);
+    save_global_doc_to_path(path, &doc);
     Ok(())
 }
 
@@ -1815,7 +1830,7 @@ const CONFIG_FILE_HEADER: &str = "# ai-jail sandbox configuration\n\
                   # Edit freely. Regenerate with: \
                   ai-jail --clean --init\n\n";
 
-fn save_global_doc_to_path(path: &Path, global: &GlobalConfig) {
+fn save_global_doc_to_path(path: &Path, doc: &toml_edit::DocumentMut) {
     let header = CONFIG_FILE_HEADER;
     // A trusted symlink is followed for writes too, so a stow-managed
     // global config stays writable instead of reading fine but failing to
@@ -1842,24 +1857,9 @@ fn save_global_doc_to_path(path: &Path, global: &GlobalConfig) {
         output::warn(&format!("Refusing to write {}: {e}", path.display()));
         return;
     }
-    let mut on_disk = global.clone();
-    collapse_tilde_config(&mut on_disk.base);
-    for command_config in on_disk.commands.values_mut() {
-        collapse_tilde_config(command_config);
-    }
-    match toml::to_string_pretty(&on_disk) {
-        Ok(body) => {
-            let contents = format!("{header}{body}");
-            if let Err(e) = write_atomic(path, &contents) {
-                output::warn(&format!(
-                    "Failed to write {}: {e}",
-                    path.display()
-                ));
-            }
-        }
-        Err(e) => {
-            output::warn(&format!("Failed to serialize config: {e}"));
-        }
+    let contents = format!("{header}{doc}");
+    if let Err(e) = write_atomic(path, &contents) {
+        output::warn(&format!("Failed to write {}: {e}", path.display()));
     }
 }
 
@@ -7229,6 +7229,75 @@ ANTHROPIC_API_KEY = "api.anthropic.com"
 
         assert!(error.contains(&format!("Failed to parse {}", path.display())));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_global_preserves_never_serialized_fields() {
+        // save_global rewrites $HOME/.ai-jail for status-bar
+        // preferences. The never-serialized trusted fields (env_pass,
+        // env_from_file, secret_hosts, secret provider settings) exist
+        // only in this file; a preference save must not destroy them.
+        let dir = std::env::temp_dir().join(format!(
+            "ai-jail-save-global-preserve-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".ai-jail");
+        let original = "\
+env_pass = [\"ANTHROPIC_API_KEY\"]
+env_from_file = [\"~/.config/ai-jail/keys\"]
+secret_hosts = { ANTHROPIC_API_KEY = \"api.anthropic.com\" }
+secrets_provider_type = \"openbao\"
+secrets_provider_url = \"https://bao.internal:8200\"
+secrets_provider_ca = \"/etc/bao-ca.pem\"
+
+[secret_refs]
+ANTHROPIC_API_KEY = \"secret/ai/anthropic#key\"
+
+[commands.claude]
+secrets_provider_url = \"https://op.internal:8080\"
+";
+        std::fs::write(&path, original).unwrap();
+
+        let cfg = Config {
+            status_bar_style: Some("dark".into()),
+            ..Config::default()
+        };
+        save_global_to_path(&path, &cfg).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        for field in [
+            "env_pass",
+            "env_from_file",
+            "secret_hosts",
+            "secrets_provider_type",
+            "secrets_provider_url",
+            "secrets_provider_ca",
+            "secret_refs",
+            "ANTHROPIC_API_KEY",
+            "[commands.claude]",
+            "status_bar_style",
+        ] {
+            assert!(saved.contains(field), "lost {field}:\n{saved}");
+        }
+        // The saved file still parses and keeps the values.
+        let global = load_global_from_path(&path).unwrap();
+        assert_eq!(
+            global.base.secrets_provider_type.as_deref(),
+            Some("openbao")
+        );
+        assert_eq!(
+            global
+                .base
+                .secret_refs
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
+            Some("secret/ai/anthropic#key")
+        );
+        assert_eq!(global.base.status_bar_style.as_deref(), Some("dark"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
