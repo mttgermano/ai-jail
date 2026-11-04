@@ -10,6 +10,7 @@
 //! falls back to the local environment, and the provider token never
 //! reaches the sandbox.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -327,18 +328,171 @@ fn fetch_openbao(
 /// match by `label` first, then `id`, exactly one match, take `value`.
 /// Header `Authorization: Bearer <token>`.
 ///
-/// TODO(onepassword): implement. Shared helpers available:
-/// `http_get_json`, `percent_encode`, `escape_filter_value`,
-/// `check_value`, `err_ctx`.
 fn fetch_onepassword(
-    _base: &Base,
-    _ca_path: Option<&Path>,
-    _token: &str,
+    base: &Base,
+    ca_path: Option<&Path>,
+    token: &str,
     wanted: &[(String, String)],
 ) -> Result<Vec<(String, String)>, String> {
-    Err(format!(
-        "onepassword backend not implemented ({} keys wanted)",
-        wanted.len()
+    let auth = format!("Bearer {token}");
+    let headers = [("Authorization", auth.as_str())];
+    // Per-launch caches so repeated vaults/items are resolved once:
+    // vault name → id, and (vault id, item title) → item id.
+    let mut vault_ids: HashMap<String, String> = HashMap::new();
+    let mut item_ids: HashMap<(String, String), String> = HashMap::new();
+    let mut out = Vec::with_capacity(wanted.len());
+
+    for (key, r) in wanted {
+        // Refs are validated upstream: exactly Vault/Item/field.
+        let mut segs = r.splitn(3, '/');
+        let vault_seg = segs.next().unwrap_or("");
+        let item_seg = segs.next().unwrap_or("");
+        let field = segs.next().unwrap_or("");
+
+        let lookup =
+            |path: &str, what: &str, name: &str| -> Result<String, String> {
+                let list = http_get_json(base, ca_path, &headers, path)
+                    .map_err(|e| err_ctx(key, r, &e))?;
+                parse_single_id(&list, key, r, what, name)
+            };
+
+        // Vault: an ID is used directly, a name is resolved with a
+        // filtered list query and cached for the launch.
+        let vid = if is_connect_id(vault_seg) {
+            vault_seg.to_string()
+        } else if let Some(id) = vault_ids.get(vault_seg) {
+            id.clone()
+        } else {
+            let filter =
+                format!("name eq \"{}\"", escape_filter_value(vault_seg));
+            let path = format!("/v1/vaults?filter={}", percent_encode(&filter));
+            let id = lookup(&path, "vault", vault_seg)?;
+            vault_ids.insert(vault_seg.to_string(), id.clone());
+            id
+        };
+
+        // Item: an ID is used directly, a title is resolved within
+        // the vault and cached for the launch.
+        let iid = if is_connect_id(item_seg) {
+            item_seg.to_string()
+        } else if let Some(id) =
+            item_ids.get(&(vid.clone(), item_seg.to_string()))
+        {
+            id.clone()
+        } else {
+            let filter =
+                format!("title eq \"{}\"", escape_filter_value(item_seg));
+            let path = format!(
+                "/v1/vaults/{}/items?filter={}",
+                percent_encode(&vid),
+                percent_encode(&filter)
+            );
+            let id = lookup(&path, "item", item_seg)?;
+            item_ids.insert((vid.clone(), item_seg.to_string()), id.clone());
+            id
+        };
+
+        let path = format!(
+            "/v1/vaults/{}/items/{}",
+            percent_encode(&vid),
+            percent_encode(&iid)
+        );
+        let item = http_get_json(base, ca_path, &headers, &path)
+            .map_err(|e| err_ctx(key, r, &e))?;
+        out.push((key.clone(), item_field_value(&item, key, r, field)?));
+    }
+    Ok(out)
+}
+
+/// Is this ref segment a 26-character Connect ID? Vault and item IDs
+/// are exactly 26 ASCII alphanumerics; anything else is a name to
+/// resolve with a filtered list query.
+fn is_connect_id(s: &str) -> bool {
+    s.len() == 26 && s.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Pick the single `id` out of a filtered-list response (a JSON
+/// array). Zero matches and more than one match are errors naming the
+/// env key, the ref and the lookup; the response body never reaches
+/// the message.
+fn parse_single_id(
+    list: &serde_json::Value,
+    key: &str,
+    r: &str,
+    what: &str,
+    name: &str,
+) -> Result<String, String> {
+    let items = list.as_array().ok_or_else(|| {
+        err_ctx(key, r, "provider response is not a JSON array")
+    })?;
+    match items.len() {
+        0 => Err(err_ctx(key, r, &format!("no {what} named {name:?}"))),
+        1 => items
+            .first()
+            .and_then(|entry| entry.get("id"))
+            .and_then(|id| id.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                err_ctx(key, r, &format!("{what} entry has no id string"))
+            }),
+        n => Err(err_ctx(
+            key,
+            r,
+            &format!("multiple {what}s named {name:?} ({n} matches)"),
+        )),
+    }
+}
+
+/// Extract the wanted field's value from an item JSON object:
+/// `fields[]` is matched by `label` first, then by `id`, requiring
+/// exactly one match either way. The value must be a JSON string and
+/// passes through `check_value`.
+fn item_field_value(
+    item: &serde_json::Value,
+    key: &str,
+    r: &str,
+    field: &str,
+) -> Result<String, String> {
+    let no_fields: [serde_json::Value; 0] = [];
+    let fields = item
+        .get("fields")
+        .and_then(|f| f.as_array())
+        .map(|v| v.as_slice())
+        .unwrap_or(&no_fields);
+
+    for attr in ["label", "id"] {
+        let hits: Vec<&serde_json::Value> = fields
+            .iter()
+            .filter(|f| f.get(attr).and_then(|v| v.as_str()) == Some(field))
+            .collect();
+        match hits.as_slice() {
+            [hit] => {
+                let raw = hit
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        err_ctx(
+                            key,
+                            r,
+                            "matched item field has no string value",
+                        )
+                    })?;
+                return check_value(raw).map_err(|e| err_ctx(key, r, &e));
+            }
+            [] => {} // try the next match attribute
+            _ => {
+                return Err(err_ctx(
+                    key,
+                    r,
+                    &format!("multiple item fields with {attr} {field:?}"),
+                ));
+            }
+        }
+    }
+    Err(err_ctx(
+        key,
+        r,
+        &format!("item has no field named {field:?}"),
     ))
 }
 
@@ -844,5 +998,233 @@ mod openbao_tests {
 /// Tests for the 1Password Connect backend (canned JSON, no network).
 #[cfg(test)]
 mod onepassword_tests {
-    // TODO(onepassword): backend tests.
+    use super::*;
+
+    #[test]
+    fn connect_id_recognizes_26_char_ids_only() {
+        assert!(is_connect_id("hqn4xa7hjkmz6fnz3a4uwsydce"));
+        // Too short, too long, punctuation, a plain name, empty.
+        assert!(!is_connect_id("hqn4xa7hjkmz6fnz3a4uwsydc"));
+        assert!(!is_connect_id("hqn4xa7hjkmz6fnz3a4uwsydceX"));
+        assert!(!is_connect_id("hqn4xa7hjkmz6fnz3a4uwsydc!"));
+        assert!(!is_connect_id("Dev"));
+        assert!(!is_connect_id(""));
+    }
+
+    #[test]
+    fn name_lookup_single_hit_extracts_id() {
+        let vaults = serde_json::json!([
+            {"id": "hqn4xa7hjkmz6fnz3a4uwsydce", "name": "Dev"}
+        ]);
+        let vid = parse_single_id(
+            &vaults,
+            "KEY",
+            "Dev/Item/password",
+            "vault",
+            "Dev",
+        )
+        .unwrap();
+        assert_eq!(vid, "hqn4xa7hjkmz6fnz3a4uwsydce");
+
+        let items = serde_json::json!([
+            {"id": "bbbbbbbbbbbbbbbbbbbbbbbbbb", "title": "Item"}
+        ]);
+        let iid =
+            parse_single_id(&items, "KEY", "Dev/Item/password", "item", "Item")
+                .unwrap();
+        assert_eq!(iid, "bbbbbbbbbbbbbbbbbbbbbbbbbb");
+    }
+
+    #[test]
+    fn name_lookup_zero_matches_is_an_error() {
+        let err = parse_single_id(
+            &serde_json::json!([]),
+            "KEY",
+            "Dev/Item/password",
+            "vault",
+            "Dev",
+        )
+        .unwrap_err();
+        assert!(err.contains("no vault named \"Dev\""), "{err}");
+        assert!(err.starts_with("secret KEY (Dev/Item/password):"), "{err}");
+    }
+
+    #[test]
+    fn name_lookup_multiple_matches_is_ambiguous() {
+        let vaults = serde_json::json!([
+            {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaa", "name": "Dev"},
+            {"id": "bbbbbbbbbbbbbbbbbbbbbbbbbb", "name": "Dev"},
+        ]);
+        let err = parse_single_id(
+            &vaults,
+            "KEY",
+            "Dev/Item/password",
+            "vault",
+            "Dev",
+        )
+        .unwrap_err();
+        assert!(err.contains("multiple vaults named \"Dev\""), "{err}");
+    }
+
+    #[test]
+    fn name_lookup_rejects_non_array_response() {
+        let err = parse_single_id(
+            &serde_json::json!({"id": "x"}),
+            "KEY",
+            "Dev/Item/password",
+            "vault",
+            "Dev",
+        )
+        .unwrap_err();
+        assert!(err.contains("not a JSON array"), "{err}");
+    }
+
+    #[test]
+    fn name_lookup_rejects_entry_without_id() {
+        let err = parse_single_id(
+            &serde_json::json!([{"name": "Dev"}]),
+            "KEY",
+            "Dev/Item/password",
+            "vault",
+            "Dev",
+        )
+        .unwrap_err();
+        assert!(err.contains("no id string"), "{err}");
+    }
+
+    #[test]
+    fn item_field_matches_by_label_first() {
+        // Both a label hit and an id hit exist; the label one wins.
+        let item = serde_json::json!({
+            "fields": [
+                {"id": "label_username", "label": "username", "value": "bob"},
+                {"id": "label_password", "label": "password", "value": "hunter2"},
+                {"id": "password", "label": "Notes", "value": "ignored"},
+            ]
+        });
+        let v = item_field_value(&item, "K", "Dev/Item/password", "password")
+            .unwrap();
+        assert_eq!(v, "hunter2");
+    }
+
+    #[test]
+    fn item_field_falls_back_to_id_without_label_match() {
+        // No field is labelled "password"; the second field carries it
+        // as its id instead.
+        let item = serde_json::json!({
+            "fields": [
+                {"id": "label_username", "label": "username", "value": "bob"},
+                {"id": "password", "label": "Notes", "value": "hunter2"},
+            ]
+        });
+        let v = item_field_value(&item, "K", "Dev/Item/password", "password")
+            .unwrap();
+        assert_eq!(v, "hunter2");
+    }
+
+    #[test]
+    fn item_field_no_match_is_an_error() {
+        let item = serde_json::json!({
+            "fields": [
+                {"id": "label_username", "label": "username", "value": "bob"}
+            ]
+        });
+        let err = item_field_value(&item, "K", "Dev/Item/password", "password")
+            .unwrap_err();
+        assert!(err.contains("no field named \"password\""), "{err}");
+        assert!(err.starts_with("secret K (Dev/Item/password):"), "{err}");
+    }
+
+    #[test]
+    fn item_field_duplicate_label_is_ambiguous() {
+        let item = serde_json::json!({
+            "fields": [
+                {"id": "one", "label": "password", "value": "a"},
+                {"id": "two", "label": "password", "value": "b"},
+            ]
+        });
+        let err = item_field_value(&item, "K", "Dev/Item/password", "password")
+            .unwrap_err();
+        assert!(err.contains("multiple item fields with label"), "{err}");
+    }
+
+    #[test]
+    fn item_field_duplicate_id_is_ambiguous() {
+        let item = serde_json::json!({
+            "fields": [
+                {"id": "password", "label": "one", "value": "a"},
+                {"id": "password", "label": "two", "value": "b"},
+            ]
+        });
+        let err = item_field_value(&item, "K", "Dev/Item/password", "password")
+            .unwrap_err();
+        assert!(err.contains("multiple item fields with id"), "{err}");
+    }
+
+    #[test]
+    fn item_field_value_passes_check_value() {
+        // One trailing newline is stripped.
+        let item = serde_json::json!({
+            "fields": [{"id": "password", "value": "hunter2\n"}]
+        });
+        let v = item_field_value(&item, "K", "Dev/Item/f", "password").unwrap();
+        assert_eq!(v, "hunter2");
+
+        // Control characters are rejected, and the value is not echoed.
+        let item = serde_json::json!({
+            "fields": [{"id": "password", "value": "hunter\t2"}]
+        });
+        let err =
+            item_field_value(&item, "K", "Dev/Item/f", "password").unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+        assert!(!err.contains("hunter"), "{err}");
+
+        // An empty value is rejected.
+        let item = serde_json::json!({
+            "fields": [{"id": "password", "value": ""}]
+        });
+        let err =
+            item_field_value(&item, "K", "Dev/Item/f", "password").unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn item_field_rejects_non_string_value() {
+        let item = serde_json::json!({
+            "fields": [{"id": "password", "value": 42}]
+        });
+        let err =
+            item_field_value(&item, "K", "Dev/Item/f", "password").unwrap_err();
+        assert!(err.contains("string value"), "{err}");
+    }
+
+    #[test]
+    fn errors_never_contain_the_token() {
+        let token = "super-secret-connect-bearer-token";
+
+        // A response body that carries the token must not leak into a
+        // lookup error.
+        let vaults = serde_json::json!([
+            {"id": "aaaaaaaaaaaaaaaaaaaaaaaaaa", "name": token},
+            {"id": "bbbbbbbbbbbbbbbbbbbbbbbbbb", "name": token},
+        ]);
+        let err = parse_single_id(
+            &vaults,
+            "KEY",
+            "Dev/Item/password",
+            "vault",
+            "Dev",
+        )
+        .unwrap_err();
+        assert!(!err.contains(token), "{err}");
+
+        // Nor into a field error, even when the value holds it.
+        let item = serde_json::json!({
+            "fields": [{"id": "password", "value": format!("{token}\t")}]
+        });
+        let err =
+            item_field_value(&item, "KEY", "Dev/Item/password", "password")
+                .unwrap_err();
+        assert!(!err.contains(token), "{err}");
+    }
 }
