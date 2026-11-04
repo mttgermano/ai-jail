@@ -15,6 +15,7 @@ mod proxy;
 mod pty;
 mod sandbox;
 mod secret;
+mod secret_provider;
 mod signals;
 mod statusbar;
 
