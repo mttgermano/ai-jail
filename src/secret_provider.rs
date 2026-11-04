@@ -254,10 +254,15 @@ pub(crate) fn escape_filter_value(s: &str) -> String {
 }
 
 /// Maximum accepted secret value size, and the value sanity check:
-/// non-empty, at most 4096 bytes, no control characters. One trailing
-/// newline is stripped before those checks.
+/// non-empty, at most 4096 bytes, no control characters other than
+/// tab and newline (PEM keys, JSON blobs and other multi-line values
+/// are legitimate). One trailing newline (`\n` or `\r\n`) is stripped
+/// before those checks.
 pub(crate) fn check_value(raw: &str) -> Result<String, String> {
-    let value = raw.strip_suffix('\n').unwrap_or(raw);
+    let value = raw
+        .strip_suffix("\r\n")
+        .or_else(|| raw.strip_suffix('\n'))
+        .unwrap_or(raw);
     if value.is_empty() {
         return Err("secret value is empty".into());
     }
@@ -267,7 +272,10 @@ pub(crate) fn check_value(raw: &str) -> Result<String, String> {
             value.len()
         ));
     }
-    if value.bytes().any(|b| b.is_ascii_control()) {
+    if value
+        .bytes()
+        .any(|b| b.is_ascii_control() && !matches!(b, b'\t' | b'\n' | b'\r'))
+    {
         return Err("secret value contains a control character".into());
     }
     Ok(value.to_string())
@@ -296,6 +304,12 @@ pub fn fetch(
     }
     if token.is_empty() {
         return Err("secret provider token is empty".into());
+    }
+    // The token travels in a request header: a control character would
+    // corrupt the request head or smuggle headers to the provider.
+    // The error never echoes the token.
+    if token.bytes().any(|b| b.is_ascii_control()) {
+        return Err("secret provider token contains a control character".into());
     }
     match kind {
         Kind::OnePassword => fetch_onepassword(base, ca_path, token, wanted),
@@ -564,6 +578,21 @@ const MAX_BODY: u64 = 1024 * 1024;
 /// Sanity cap on the response header block.
 const MAX_HEAD: usize = 64 * 1024;
 
+/// The HTTP `Host` header value: IPv6 literals must be bracketed, or
+/// `http://[::1]:8200` would send `Host: ::1:8200`, which servers
+/// cannot parse and answer with 400.
+fn host_header(base: &Base) -> String {
+    let host = if base.host.contains(':') {
+        format!("[{}]", base.host)
+    } else {
+        base.host.clone()
+    };
+    match base.port {
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    }
+}
+
 /// Issue one authenticated `GET` against the provider and parse the
 /// response body as JSON. `path` must start with `/` and already be
 /// percent-encoded. Non-2xx responses are an error that names only the
@@ -588,10 +617,7 @@ fn http_get_json_with(
     read_timeout: Duration,
 ) -> Result<serde_json::Value, String> {
     let mut stream = connect(base, ca_path, read_timeout)?;
-    let host_header = match base.port {
-        Some(p) => format!("{}:{p}", base.host),
-        None => base.host.clone(),
-    };
+    let host_header = host_header(base);
     let mut req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n"
     );
@@ -843,7 +869,14 @@ fn read_chunked(stream: &mut dyn ReadWrite) -> Result<Vec<u8>, String> {
         .map_err(|_| {
             "provider response has a malformed chunk size".to_string()
         })?;
-        if body.len() + size > MAX_BODY as usize {
+        // checked_add: a hostile size near usize::MAX must be refused
+        // as too large, not overflow (a debug panic) or wrap (a giant
+        // allocation).
+        let total = body
+            .len()
+            .checked_add(size)
+            .ok_or_else(|| "provider response is too large".to_string())?;
+        if total > MAX_BODY as usize {
             return Err("provider response is too large".into());
         }
         if size == 0 {
@@ -1028,13 +1061,58 @@ mod tests {
     #[test]
     fn value_checks() {
         assert_eq!(check_value("hello").unwrap(), "hello");
+        // One trailing newline (\n or \r\n) is stripped.
         assert_eq!(check_value("hello\n").unwrap(), "hello");
-        assert!(check_value("hello\n\n").is_err()); // embedded newline is a control char
+        assert_eq!(check_value("hello\r\n").unwrap(), "hello");
+        // Multi-line values are legitimate (PEM keys, JSON blobs).
+        assert_eq!(
+            check_value("-----BEGIN KEY-----\nabc\n-----END KEY-----").unwrap(),
+            "-----BEGIN KEY-----\nabc\n-----END KEY-----"
+        );
+        assert_eq!(
+            check_value("{\"k\": \"v\",\n\"j\": 2}").unwrap(),
+            "{\"k\": \"v\",\n\"j\": 2}"
+        );
+        assert_eq!(check_value("hello\n\n").unwrap(), "hello\n");
+        assert_eq!(check_value("a\tb").unwrap(), "a\tb");
         assert!(check_value("").is_err());
         assert!(check_value("\n").is_err());
-        assert!(check_value("a\tb").is_err()); // control char
+        assert!(check_value("\r\n").is_err());
+        assert!(check_value("a\0b").is_err()); // NUL is a control char
+        assert!(check_value("a\u{1b}b").is_err()); // ESC too
         assert!(check_value(&"x".repeat(4097)).is_err());
         assert!(check_value(&"x".repeat(4096)).is_ok());
+    }
+
+    #[test]
+    fn fetch_rejects_token_with_control_characters() {
+        // A \r\n in the token would corrupt or smuggle request headers;
+        // the error must refuse it without echoing it.
+        let base = parse_url("http://127.0.0.1:8200").unwrap();
+        for bad in ["one\r\ntwo", "bad\n", "bad\t?"] {
+            let error = fetch(
+                Kind::OpenBao,
+                &base,
+                None,
+                bad,
+                &[("K".into(), "m/p#f".into())],
+            )
+            .unwrap_err();
+            assert!(error.contains("control character"), "{error}");
+            assert!(!error.contains(bad), "token leaked: {error}");
+        }
+    }
+
+    #[test]
+    fn host_header_brackets_ipv6_and_keeps_ports() {
+        let b = parse_url("http://[::1]:8200").unwrap();
+        assert_eq!(host_header(&b), "[::1]:8200");
+        let b = parse_url("https://bao.internal:8200").unwrap();
+        assert_eq!(host_header(&b), "bao.internal:8200");
+        let b = parse_url("https://[::1]").unwrap();
+        assert_eq!(host_header(&b), "[::1]");
+        let b = parse_url("https://vault.example.com").unwrap();
+        assert_eq!(host_header(&b), "vault.example.com");
     }
 
     #[test]
@@ -1252,6 +1330,52 @@ mod openbao_tests {
         assert!(!err.contains("permission denied"), "{err}");
         assert!(!err.contains("value-one"), "{err}");
     }
+
+    #[test]
+    fn openbao_accepts_multiline_values() {
+        // PEM-style and JSON-style values, and a \r\n tail, fetch
+        // cleanly through the full kv2 parse path.
+        for (raw, want) in [
+            ("-- line1\n-- line2\n", "-- line1\n-- line2"),
+            ("{\"k\": 1,\n\"arr\": [2]}", "{\"k\": 1,\n\"arr\": [2]}"),
+            ("tok\r\n", "tok"),
+        ] {
+            let value = parse_kv2_response(
+                &serde_json::json!({"data": {"data": {"value": raw}}}),
+                "KEY",
+                "secret/ai/app#value",
+                "value",
+            )
+            .unwrap();
+            assert_eq!(value, want, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn openbao_sends_well_formed_host_header() {
+        // The request head must carry `Host: localhost:<port>` — built
+        // by host_header(), which also brackets IPv6 literals (unit
+        // tested in the shared tests module). An unbracketed header is
+        // what IPv6 URLs used to produce, and servers answer it 400.
+        let fx = tls_fixture(vec![Some(super::http_tests::cl_response(
+            &kv2_body("value"),
+        ))]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        fetch_openbao(
+            &base,
+            Some(&ca_path()),
+            TOKEN,
+            &[("K".into(), "secret/ai/one#api_key".into())],
+        )
+        .unwrap();
+        let reqs = fx.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert!(
+            reqs[0].contains(&format!("Host: localhost:{}\r\n", fx.port)),
+            "{reqs:?}"
+        );
+    }
 }
 
 /// Tests for the 1Password Connect backend (canned JSON, no network).
@@ -1429,9 +1553,10 @@ mod onepassword_tests {
         let v = item_field_value(&item, "K", "Dev/Item/f", "password").unwrap();
         assert_eq!(v, "hunter2");
 
-        // Control characters are rejected, and the value is not echoed.
+        // Control characters are rejected (tab is legitimate now), and
+        // the value is not echoed.
         let item = serde_json::json!({
-            "fields": [{"id": "password", "value": "hunter\t2"}]
+            "fields": [{"id": "password", "value": "hunter\u{1b}2"}]
         });
         let err =
             item_field_value(&item, "K", "Dev/Item/f", "password").unwrap_err();
@@ -1479,7 +1604,7 @@ mod onepassword_tests {
 
         // Nor into a field error, even when the value holds it.
         let item = serde_json::json!({
-            "fields": [{"id": "password", "value": format!("{token}\t")}]
+            "fields": [{"id": "password", "value": format!("{token}\u{1b}")}]
         });
         let err =
             item_field_value(&item, "KEY", "Dev/Item/password", "password")
@@ -1618,6 +1743,18 @@ mod http_tests {
         )
     }
 
+    /// 200 chunked with a real first chunk and a second chunk whose
+    /// announced size is near `usize::MAX`: the accumulated-length
+    /// check must refuse it as too large, not overflow (a debug panic)
+    /// or wrap into a giant allocation.
+    pub(crate) fn oversized_chunk_response() -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n2\r\nok\r\n{:x}\r\n",
+            usize::MAX - 1
+        )
+    }
+
     /// A non-2xx with a body the error must not echo.
     pub(crate) fn status_response(
         status: u16,
@@ -1694,6 +1831,25 @@ mod http_tests {
         )
         .unwrap_err();
         // Rejected by the cap before any body read.
+        assert!(err.contains("too large"), "{err}");
+        assert!(!err.contains(token), "{err}");
+    }
+
+    #[test]
+    fn http_get_json_rejects_oversized_chunk_size() {
+        let token = "hvs.big-chunk-token";
+        let fx = tls_fixture(vec![Some(oversized_chunk_response())]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        let err = http_get_json(
+            &base,
+            Some(&ca_path()),
+            &[("X-Vault-Token", token)],
+            "/v1/secret/data/k",
+        )
+        .unwrap_err();
+        // The 2-byte first chunk plus the huge announced size must be
+        // refused as too large — not overflow the length sum.
         assert!(err.contains("too large"), "{err}");
         assert!(!err.contains(token), "{err}");
     }

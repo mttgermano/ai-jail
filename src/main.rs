@@ -274,20 +274,29 @@ fn reject_provider_token_env_entry(
 /// single-threaded before the proxy and PTY start, so `--inherit-env`
 /// cannot copy a variable that is already gone. A missing or empty
 /// token is a launch error naming the hint.
-fn read_and_clear_token() -> Result<String, String> {
-    const HINT: &str = "export AI_JAIL_SECRET_TOKEN=<provider token>";
-    let token = match std::env::var("AI_JAIL_SECRET_TOKEN") {
-        Ok(token) => token,
-        Err(_) => {
-            return Err(format!("AI_JAIL_SECRET_TOKEN is not set: {HINT}"));
-        }
-    };
+/// Capture the vault token out of the supervisor environment and scrub
+/// it immediately: it must never reach any child process, sandboxed or
+/// not. Called unconditionally on every launch; returns whatever was
+/// set (an empty value is rejected when it is actually used — see
+/// [`require_provider_token`]).
+fn take_provider_token() -> Option<String> {
+    let token = std::env::var("AI_JAIL_SECRET_TOKEN").ok();
     // Edition 2024: process-global env mutation is unsafe by contract.
     unsafe { std::env::remove_var("AI_JAIL_SECRET_TOKEN") };
-    if token.is_empty() {
-        return Err(format!("AI_JAIL_SECRET_TOKEN is empty: {HINT}"));
+    token
+}
+
+/// The fetch path's token check: a missing or empty token is an error
+/// with a hint, raised only when something is actually fetched.
+fn require_provider_token(token: &Option<String>) -> Result<String, String> {
+    const HINT: &str = "export AI_JAIL_SECRET_TOKEN=<provider token>";
+    match token {
+        None => Err(format!("AI_JAIL_SECRET_TOKEN is not set: {HINT}")),
+        Some(t) if t.is_empty() => {
+            Err(format!("AI_JAIL_SECRET_TOKEN is empty: {HINT}"))
+        }
+        Some(t) => Ok(t.clone()),
     }
-    Ok(token)
 }
 
 // Fetch closure handed to `apply_secret_provider`: receives the parsed
@@ -347,6 +356,19 @@ fn apply_secret_provider(
     };
     let kind = crate::secret_provider::Kind::parse(type_text)?;
     let base = crate::secret_provider::parse_url(url)?;
+    // A relative CA path would be resolved against the launch
+    // directory: inside a cloned repository the project could ship its
+    // own CA and intercept the token and secrets. trusted config only
+    // supplies this field, so require it absolute.
+    if let Some(ca) = config.secrets_provider_ca.as_ref()
+        && !ca.is_absolute()
+    {
+        return Err(format!(
+            "secrets_provider_ca {} must be an absolute path: a relative \
+             path would be resolved against the project directory",
+            ca.display()
+        ));
+    }
 
     // Wanted keys: bare env entries named in secret_refs,
     // first-occurrence order, deduplicated.
@@ -940,6 +962,15 @@ fn run() -> Result<i32, String> {
     let cli = cli::parse()?;
     validate_write_flags(&cli)?;
 
+    // Capture and scrub the vault token on EVERY launch, before
+    // anything else runs: it must never reach any child process, and
+    // with --inherit-env the whole supervisor environment is copied
+    // into the sandbox. A capture that only happened when the provider
+    // is used would leak the token on every other launch. The fetch
+    // closure below uses the captured value; the provider being off
+    // just means the token is dropped.
+    let provider_token = take_provider_token();
+
     // Suppress info/warn output in --exec mode for clean stdout
     if cli.exec {
         output::set_quiet(true);
@@ -1277,16 +1308,18 @@ fn run() -> Result<i32, String> {
 
     // --secret-provider: resolve bare --env NAME entries from the
     // configured vault on the host, before anything else can observe
-    // the supervisor's environment. The token is read and removed from
-    // this process's environment inside the fetch closure — still
-    // single-threaded here, before the proxy and PTY start, so
-    // --inherit-env cannot copy it into the sandbox.
+    // the supervisor's environment. The token was already captured and
+    // scrubbed from this process's environment at the top of the
+    // launch (take_provider_token) — still single-threaded here,
+    // before the proxy and PTY start, so --inherit-env cannot copy it
+    // into the sandbox. It is validated only when something is
+    // actually fetched.
     let ca = config.secrets_provider_ca.clone();
     let fetch = move |kind: crate::secret_provider::Kind,
                       base: &crate::secret_provider::Base,
                       wanted: &[(String, String)]|
           -> Result<Vec<(String, String)>, String> {
-        let token = read_and_clear_token()?;
+        let token = require_provider_token(&provider_token)?;
         crate::secret_provider::fetch(kind, base, ca.as_deref(), &token, wanted)
     };
     apply_secret_provider(
@@ -1717,12 +1750,12 @@ mod tests {
         default_agent_api_egress_applies, default_registry_egress_applies,
         default_resize_redraw_key, exec_requires_terminal_passthrough,
         internal_mode_inherits_quiet, prune_missing_path_entries,
-        pty_proxy_active, read_and_clear_token,
-        reject_provider_token_env_entry, resolve_browser_profile,
+        pty_proxy_active, reject_provider_token_env_entry,
+        require_provider_token, resolve_browser_profile,
         running_inside_multiplexer, should_auto_save_project_config,
         should_check_update, should_save_global_preferences,
-        untrusted_project_command_carries_credentials, validate_network_flags,
-        validate_write_flags,
+        take_provider_token, untrusted_project_command_carries_credentials,
+        validate_network_flags, validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
@@ -2341,29 +2374,72 @@ mod tests {
     }
 
     #[test]
-    fn read_and_clear_token_returns_and_removes() {
+    fn secret_provider_rejects_relative_ca_path() {
+        // A relative CA path would resolve against the launch
+        // directory: a cloned repository could ship its own CA and
+        // intercept the token and secrets.
+        let calls = std::cell::Cell::new(0_usize);
+        let fetch = recording_fetch(&calls);
+
+        let mut config = provider_config();
+        config.secrets_provider_ca = Some("certs/ca.pem".into());
+        config.env_pass = vec!["KEY".into()];
+        config
+            .secret_refs
+            .insert("KEY".into(), "secret/ai/k#value".into());
+        let error = apply_secret_provider(&mut config, true, false, &fetch)
+            .unwrap_err();
+        assert!(error.contains("absolute"), "{error}");
+        assert!(error.contains("certs/ca.pem"), "{error}");
+        assert_eq!(calls.get(), 0);
+
+        // An absolute path is accepted and fetches.
+        let mut config = provider_config();
+        config.secrets_provider_ca = Some("/etc/bao-ca.pem".into());
+        config.env_pass = vec!["KEY".into()];
+        config
+            .secret_refs
+            .insert("KEY".into(), "secret/ai/k#value".into());
+        apply_secret_provider(&mut config, true, false, &fetch).unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(config.env_pass, vec!["KEY=value-for-KEY"]);
+    }
+
+    #[test]
+    fn take_provider_token_captures_and_clears() {
         let _env = ENV_LOCK.lock().unwrap();
         let _guard = EnvVarGuard::set("AI_JAIL_SECRET_TOKEN", "tok-123");
-        let token = read_and_clear_token().unwrap();
-        assert_eq!(token, "tok-123");
+        let token = take_provider_token();
+        assert_eq!(token.as_deref(), Some("tok-123"));
         // Removed from the supervisor environment immediately: it can
-        // never be copied into the sandbox.
+        // never be copied into the sandbox — with or without
+        // --inherit-env, and whether or not --secret-provider is used.
         assert!(std::env::var("AI_JAIL_SECRET_TOKEN").is_err());
         // EnvVarGuard restores the saved value (none) on drop.
     }
 
     #[test]
-    fn read_and_clear_token_refuses_missing_and_empty() {
+    fn take_provider_token_missing_is_none() {
+        // Capture is unconditional and must not error when the token
+        // is simply absent: the error belongs to the fetch path.
         let _env = ENV_LOCK.lock().unwrap();
         let _absent = EnvVarGuard::remove("AI_JAIL_SECRET_TOKEN");
-        let error = read_and_clear_token().unwrap_err();
+        assert_eq!(take_provider_token(), None);
+    }
+
+    #[test]
+    fn require_provider_token_refuses_missing_and_empty() {
         assert!(
-            error.contains("export AI_JAIL_SECRET_TOKEN=<provider token>"),
-            "{error}"
+            require_provider_token(&None)
+                .unwrap_err()
+                .contains("export AI_JAIL_SECRET_TOKEN=<provider token>")
         );
-        let _empty = EnvVarGuard::set("AI_JAIL_SECRET_TOKEN", "");
-        let error = read_and_clear_token().unwrap_err();
-        assert!(error.contains("empty"), "{error}");
+        assert!(
+            require_provider_token(&Some(String::new()))
+                .unwrap_err()
+                .contains("empty")
+        );
+        assert_eq!(require_provider_token(&Some("tok".into())).unwrap(), "tok");
     }
 
     #[test]

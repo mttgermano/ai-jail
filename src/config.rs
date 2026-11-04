@@ -1804,14 +1804,18 @@ fn save_global_to_path(path: &Path, config: &Config) -> Result<(), String> {
     // never-serialized trusted field (env_pass, env_from_file,
     // secret_hosts, the secret-provider type/url/ca/refs) — values that
     // exist only in this file and that the user did not ask to change.
-    let mut doc = match std::fs::read_to_string(path) {
-        Ok(raw) => raw
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?,
-        Err(_) if !path.exists() => toml_edit::DocumentMut::new(),
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => Some(raw),
+        Err(_) if !path.exists() => None,
         Err(e) => {
             return Err(format!("Failed to read {}: {e}", path.display()));
         }
+    };
+    let mut doc = match &raw {
+        Some(raw) => raw
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?,
+        None => toml_edit::DocumentMut::new(),
     };
     if let Some(v) = config.no_status_bar {
         doc["no_status_bar"] = toml_edit::value(v);
@@ -1819,7 +1823,13 @@ fn save_global_to_path(path: &Path, config: &Config) -> Result<(), String> {
     if let Some(v) = &config.status_bar_style {
         doc["status_bar_style"] = toml_edit::value(v.clone());
     }
-    save_global_doc_to_path(path, &doc);
+    // A document parsed from an existing file already carries the
+    // header comment from a previous save; prepending again would grow
+    // the file by one header per preference save.
+    let prepend_header = !raw
+        .as_deref()
+        .is_some_and(|raw| raw.starts_with(CONFIG_FILE_HEADER));
+    save_global_doc_to_path(path, &doc, prepend_header);
     Ok(())
 }
 
@@ -1830,7 +1840,11 @@ const CONFIG_FILE_HEADER: &str = "# ai-jail sandbox configuration\n\
                   # Edit freely. Regenerate with: \
                   ai-jail --clean --init\n\n";
 
-fn save_global_doc_to_path(path: &Path, doc: &toml_edit::DocumentMut) {
+fn save_global_doc_to_path(
+    path: &Path,
+    doc: &toml_edit::DocumentMut,
+    prepend_header: bool,
+) {
     let header = CONFIG_FILE_HEADER;
     // A trusted symlink is followed for writes too, so a stow-managed
     // global config stays writable instead of reading fine but failing to
@@ -1857,7 +1871,11 @@ fn save_global_doc_to_path(path: &Path, doc: &toml_edit::DocumentMut) {
         output::warn(&format!("Refusing to write {}: {e}", path.display()));
         return;
     }
-    let contents = format!("{header}{doc}");
+    let contents = if prepend_header {
+        format!("{header}{doc}")
+    } else {
+        doc.to_string()
+    };
     if let Err(e) = write_atomic(path, &contents) {
         output::warn(&format!("Failed to write {}: {e}", path.display()));
     }
@@ -6446,13 +6464,15 @@ ANTHROPIC_API_KEY = "api.anthropic.com"
 
     #[test]
     fn project_secret_provider_fields_are_ignored_with_warning() {
-        let mut project = Config::default();
-        project.secrets_provider_type = Some("openbao".into());
-        project.secrets_provider_url = Some("https://bao.internal:8200".into());
-        project.secrets_provider_ca = Some(PathBuf::from("/etc/bao-ca.pem"));
-        project
-            .secret_refs
-            .insert("KEY".into(), "secret/ai/k#value".into());
+        let project = Config {
+            secrets_provider_type: Some("openbao".into()),
+            secrets_provider_url: Some("https://bao.internal:8200".into()),
+            secrets_provider_ca: Some(PathBuf::from("/etc/bao-ca.pem")),
+            secret_refs: [("KEY".into(), "secret/ai/k#value".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
         let (merged, warnings) = merge_with_global_report(
             Config::default(),
             project,
@@ -6480,14 +6500,18 @@ ANTHROPIC_API_KEY = "api.anthropic.com"
         // A project config under the global trust_project_config merges
         // with trusted semantics: the provider fields are taken, not
         // ignored with a warning.
-        let mut global = Config::default();
-        global.trust_project_config = vec![PathBuf::from("/trusted")];
-        let mut project = Config::default();
-        project.secrets_provider_type = Some("openbao".into());
-        project.secrets_provider_url = Some("https://bao.internal:8200".into());
-        project
-            .secret_refs
-            .insert("KEY".into(), "secret/ai/k#value".into());
+        let global = Config {
+            trust_project_config: vec![PathBuf::from("/trusted")],
+            ..Config::default()
+        };
+        let project = Config {
+            secrets_provider_type: Some("openbao".into()),
+            secrets_provider_url: Some("https://bao.internal:8200".into()),
+            secret_refs: [("KEY".into(), "secret/ai/k#value".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
         let merged = merge_trusted_project(global, project);
         assert_eq!(merged.secrets_provider_type.as_deref(), Some("openbao"));
         assert_eq!(
@@ -6502,13 +6526,15 @@ ANTHROPIC_API_KEY = "api.anthropic.com"
 
     #[test]
     fn secret_provider_fields_are_never_serialized() {
-        let mut config = Config::default();
-        config.secrets_provider_type = Some("onepassword".into());
-        config.secrets_provider_url = Some("https://op.internal:8080".into());
-        config.secrets_provider_ca = Some(PathBuf::from("/etc/op-ca.pem"));
-        config
-            .secret_refs
-            .insert("KEY".into(), "Dev/Item/field".into());
+        let config = Config {
+            secrets_provider_type: Some("onepassword".into()),
+            secrets_provider_url: Some("https://op.internal:8080".into()),
+            secrets_provider_ca: Some(PathBuf::from("/etc/op-ca.pem")),
+            secret_refs: [("KEY".into(), "Dev/Item/field".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
         let serialized = serialize_config(&config).unwrap();
         for field in [
             "secrets_provider_type",
@@ -6531,13 +6557,19 @@ ANTHROPIC_API_KEY = "api.anthropic.com"
 
     #[test]
     fn command_table_overrides_secrets_provider_url_only() {
-        let mut global = Config::default();
-        global.secrets_provider_type = Some("openbao".into());
-        global.secrets_provider_url =
-            Some("https://global.bao.internal:8200".into());
-        let mut table = Config::default();
-        table.secrets_provider_url =
-            Some("https://claude.bao.internal:8200".into());
+        let global = Config {
+            secrets_provider_type: Some("openbao".into()),
+            secrets_provider_url: Some(
+                "https://global.bao.internal:8200".into(),
+            ),
+            ..Config::default()
+        };
+        let table = Config {
+            secrets_provider_url: Some(
+                "https://claude.bao.internal:8200".into(),
+            ),
+            ..Config::default()
+        };
         let merged = merge_with_global(global, table);
         // The scalar type survives the table's url-only override.
         assert_eq!(merged.secrets_provider_type.as_deref(), Some("openbao"));
@@ -6567,14 +6599,17 @@ ANTHROPIC_API_KEY = "api.anthropic.com"
 
     #[test]
     fn cli_overrides_secret_provider_fields() {
-        let mut config = Config::default();
-        config.secrets_provider_type = Some("openbao".into());
-        config.secrets_provider_url =
-            Some("https://config.bao.internal:8200".into());
-        config.secrets_provider_ca = Some(PathBuf::from("/config-ca.pem"));
-        config
-            .secret_refs
-            .insert("A_KEY".into(), "secret/ai/a#value".into());
+        let config = Config {
+            secrets_provider_type: Some("openbao".into()),
+            secrets_provider_url: Some(
+                "https://config.bao.internal:8200".into(),
+            ),
+            secrets_provider_ca: Some(PathBuf::from("/config-ca.pem")),
+            secret_refs: [("A_KEY".into(), "secret/ai/a#value".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
         let cli = CliArgs {
             secret_provider_type: Some("onepassword".into()),
             secret_provider_url: Some("https://cli.op.internal:8080".into()),
@@ -7296,6 +7331,36 @@ secrets_provider_url = \"https://op.internal:8080\"
                 .map(String::as_str),
             Some("secret/ai/anthropic#key")
         );
+        assert_eq!(global.base.status_bar_style.as_deref(), Some("dark"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_global_does_not_repeat_the_header_comment() {
+        // Each preference save rewrites the file; the header comment
+        // must stay a single block, not grow by one copy per save.
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-save-global-header-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".ai-jail");
+        let cfg = Config {
+            status_bar_style: Some("dark".into()),
+            ..Config::default()
+        };
+        save_global_to_path(&path, &cfg).unwrap();
+        save_global_to_path(&path, &cfg).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            saved.matches("# ai-jail sandbox configuration").count(),
+            1,
+            "{saved}"
+        );
+        assert_eq!(saved.matches("Regenerate with").count(), 1, "{saved}");
+        // The file still parses and keeps the preference.
+        let global = load_global_from_path(&path).unwrap();
         assert_eq!(global.base.status_bar_style.as_deref(), Some("dark"));
 
         let _ = std::fs::remove_dir_all(&dir);
