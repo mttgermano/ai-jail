@@ -290,6 +290,17 @@ fn read_and_clear_token() -> Result<String, String> {
     Ok(token)
 }
 
+// Fetch closure handed to `apply_secret_provider`: receives the parsed
+// provider kind and server root plus the wanted (key, ref) pairs, and
+// returns the fetched (key, value) pairs. Borrows caller state (the
+// CA path, test recorders), hence the lifetime.
+type SecretFetch<'a> = dyn Fn(
+        crate::secret_provider::Kind,
+        &crate::secret_provider::Base,
+        &[(String, String)],
+    ) -> Result<Vec<(String, String)>, String>
+    + 'a;
+
 /// `--secret-provider`: resolve bare `NAME` entries in `env_pass`
 /// against the configured vault, on the host, before the sandbox
 /// starts. `fetch` is injected so tests can fake the provider.
@@ -317,11 +328,7 @@ fn apply_secret_provider(
     config: &mut config::Config,
     use_provider: bool,
     dry_run: bool,
-    fetch: &dyn Fn(
-        crate::secret_provider::Kind,
-        &crate::secret_provider::Base,
-        &[(String, String)],
-    ) -> Result<Vec<(String, String)>, String>,
+    fetch: &SecretFetch<'_>,
 ) -> Result<(), String> {
     if !use_provider {
         return Ok(());
@@ -357,10 +364,11 @@ fn apply_secret_provider(
         }
     }
     if wanted.is_empty() {
-        output::info(
-            "secret provider: no requested keys are in secret_refs; \
+        output::info(&format!(
+            "secret provider {}: no requested keys are in secret_refs; \
              nothing fetched",
-        );
+            kind.as_str()
+        ));
         return Ok(());
     }
     for (key, r) in &wanted {
@@ -370,7 +378,8 @@ fn apply_secret_provider(
     if dry_run {
         for (key, r) in &wanted {
             output::info(&format!(
-                "secret provider (dry run): would fetch {key} from {r:?}"
+                "secret provider {} (dry run): would fetch {key} from {r:?}",
+                kind.as_str()
             ));
         }
         return Ok(());
@@ -1273,10 +1282,10 @@ fn run() -> Result<i32, String> {
     // single-threaded here, before the proxy and PTY start, so
     // --inherit-env cannot copy it into the sandbox.
     let ca = config.secrets_provider_ca.clone();
-    let fetch = |kind: crate::secret_provider::Kind,
-                 base: &crate::secret_provider::Base,
-                 wanted: &[(String, String)]|
-     -> Result<Vec<(String, String)>, String> {
+    let fetch = move |kind: crate::secret_provider::Kind,
+                      base: &crate::secret_provider::Base,
+                      wanted: &[(String, String)]|
+          -> Result<Vec<(String, String)>, String> {
         let token = read_and_clear_token()?;
         crate::secret_provider::fetch(kind, base, ca.as_deref(), &token, wanted)
     };
