@@ -302,12 +302,11 @@ pub fn fetch(
     if wanted.is_empty() {
         return Ok(Vec::new());
     }
-    if token.is_empty() {
-        return Err("secret provider token is empty".into());
-    }
     // The token travels in a request header: a control character would
     // corrupt the request head or smuggle headers to the provider.
-    // The error never echoes the token.
+    // (An empty or missing token is refused by the caller — see
+    // require_provider_token in main.rs.) The error never echoes the
+    // token.
     if token.bytes().any(|b| b.is_ascii_control()) {
         return Err("secret provider token contains a control character".into());
     }
@@ -474,10 +473,12 @@ fn fetch_onepassword(
 }
 
 /// Is this ref segment a 26-character Connect ID? Vault and item IDs
-/// are exactly 26 ASCII alphanumerics; anything else is a name to
+/// are exactly 26 lowercase ASCII letters and digits; anything else —
+/// including a 26-character mixed-case vault name — is a name to
 /// resolve with a filtered list query.
 fn is_connect_id(s: &str) -> bool {
-    s.len() == 26 && s.bytes().all(|b| b.is_ascii_alphanumeric())
+    s.len() == 26
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// Pick the single `id` out of a filtered-list response (a JSON
@@ -715,34 +716,21 @@ fn connect(
 fn load_ca_pem(
     path: &Path,
 ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
-    use rustls::pki_types::pem::PemObject;
-    let pem = std::fs::read(path)
-        .map_err(|e| format!("cannot read CA file {}: {e}", path.display()))?;
-    let text = String::from_utf8_lossy(&pem);
-    let mut ders = Vec::new();
-    let mut rest = text.as_ref();
-    while let Some(begin) = rest.find("-----BEGIN ") {
-        let Some(end_marker_start) = rest[begin..].find("-----END ") else {
-            break;
-        };
-        let end = begin + end_marker_start;
-        let block_end = rest[end..]
-            .find("-----\n")
-            .map_or(rest.len(), |i| end + i + "-----\n".len());
-        let block = &rest[begin..block_end];
-        let der =
-            rustls::pki_types::CertificateDer::from_pem_slice(block.as_bytes())
-                .map_err(|_| {
-                    format!(
-                        "cannot parse PEM certificate in {}",
-                        path.display()
-                    )
-                })?;
-        ders.push(der);
-        rest = &rest[block_end..];
-    }
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    // The rustls PEM reader iterates every certificate block and
+    // handles LF and CRLF line endings; hand-rolling the split here
+    // dropped every certificate after the first in a CRLF file.
+    let ders = CertificateDer::pem_file_iter(path)
+        .map_err(|e| format!("cannot read CA file {}: {e}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            format!("cannot parse PEM certificate in {}", path.display())
+        })?;
     if ders.is_empty() {
-        return Err(format!("no PEM certificates found in {}", path.display()));
+        return Err(format!(
+            "no PEM certificates found in {}",
+            path.display()
+        ));
     }
     Ok(ders)
 }
@@ -1116,22 +1104,51 @@ mod tests {
     }
 
     #[test]
-    fn fetch_rejects_empty_token_and_empty_wanted() {
+    fn fetch_empty_wanted_is_a_no_op() {
+        // Nothing requested: no network, no error. The empty-token
+        // refusal lives in the caller (require_provider_token), not
+        // here.
         let base = parse_url("http://127.0.0.1:8200").unwrap();
-        assert!(
-            fetch(
-                Kind::OpenBao,
-                &base,
-                None,
-                "",
-                &[("K".into(), "m/p#f".into())]
-            )
-            .is_err()
-        );
         assert_eq!(
             fetch(Kind::OpenBao, &base, None, "tok", &[]).unwrap(),
             Vec::<(String, String)>::new()
         );
+    }
+
+    #[test]
+    fn load_ca_pem_reads_every_cert_in_a_crlf_bundle() {
+        // A bundle saved with Windows line endings must load ALL of
+        // its certificates, not just the first: the old hand-rolled
+        // block split never matched `-----\n`, so certificates after
+        // the first were silently dropped and TLS failed with
+        // "unknown issuer".
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-only-cert.pem"
+        ))
+        .unwrap();
+        let crlf = fixture.replace("\r\n", "\n").replace('\n', "\r\n");
+        let dir = std::env::temp_dir().join(format!(
+            "ai-jail-ca-crlf-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ca-crlf.pem");
+
+        // Two certificates, CRLF line endings.
+        std::fs::write(&path, format!("{crlf}{crlf}")).unwrap();
+        let two = load_ca_pem(&path).unwrap();
+        assert_eq!(two.len(), 2, "CRLF bundle lost a certificate");
+
+        // One certificate, CRLF line endings.
+        std::fs::write(&path, &crlf).unwrap();
+        assert_eq!(load_ca_pem(&path).unwrap().len(), 1);
+
+        // LF line endings still load.
+        std::fs::write(&path, format!("{fixture}{fixture}")).unwrap();
+        assert_eq!(load_ca_pem(&path).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -1392,6 +1409,10 @@ mod onepassword_tests {
         assert!(!is_connect_id("hqn4xa7hjkmz6fnz3a4uwsydc!"));
         assert!(!is_connect_id("Dev"));
         assert!(!is_connect_id(""));
+        // Real Connect IDs are lowercase: a 26-character mixed-case or
+        // all-uppercase vault name is a name, not an ID.
+        assert!(!is_connect_id("ProductionSecretsVault2026"));
+        assert!(!is_connect_id("HQN4XA7HJKMZ6FNZ3A4UWSYDCE"));
     }
 
     #[test]

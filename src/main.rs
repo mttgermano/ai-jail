@@ -269,11 +269,6 @@ fn reject_provider_token_env_entry(
     Ok(())
 }
 
-/// Read the provider token from the supervisor's environment and remove
-/// it immediately: the token must never reach the jail, and this runs
-/// single-threaded before the proxy and PTY start, so `--inherit-env`
-/// cannot copy a variable that is already gone. A missing or empty
-/// token is a launch error naming the hint.
 /// Capture the vault token out of the supervisor environment and scrub
 /// it immediately: it must never reach any child process, sandboxed or
 /// not. Called unconditionally on every launch; returns whatever was
@@ -1306,6 +1301,10 @@ fn run() -> Result<i32, String> {
     // merged in, so a credential file cannot smuggle it either.
     reject_provider_token_env_entry(&config)?;
 
+    // Check the sandbox tool is available BEFORE any provider fetch: a
+    // launch that will fail anyway must not leave vault audit entries.
+    sandbox::check()?;
+
     // --secret-provider: resolve bare --env NAME entries from the
     // configured vault on the host, before anything else can observe
     // the supervisor's environment. The token was already captured and
@@ -1350,9 +1349,6 @@ fn run() -> Result<i32, String> {
     // moves into a supervisor-side SecretBinding for the egress proxy.
     // All violations hard-error here, before any sandbox starts.
     let secrets = prepare_secrets(&mut config)?;
-
-    // Check sandbox tool is available
-    sandbox::check()?;
 
     // Platform-specific info messages (e.g. no-op flags on macOS)
     sandbox::platform_notes(&config);
