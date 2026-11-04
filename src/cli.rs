@@ -108,6 +108,23 @@ OPTIONS:
                                     sees a placeholder; the egress proxy substitutes the
                                     real value only for requests to host (repeatable;
                                     requires filtered egress via --allow-host)
+    --secret-provider               Fetch bare --env NAME values from a vault
+                                    (1Password Connect or OpenBao) on the host
+                                    before the sandbox starts; the provider
+                                    token never enters the sandbox
+    --secret-provider-type <TYPE>   Provider backend: onepassword (op) or
+                                    openbao (bao); or secrets_provider_type in
+                                    the global config
+    --secret-provider-url <URL>     Provider server root, https://host[:port]
+                                    (plain http only for loopback); or
+                                    secrets_provider_url in the global config
+    --secret-provider-ca <PATH>     Extra CA certificate (PEM) for the provider
+                                    URL; or secrets_provider_ca in the global
+                                    config
+    --secret-ref <KEY=REF>          Vault reference for KEY's value, e.g.
+                                    Dev/Item/field or secret/ai/key#field
+                                    (repeatable; overrides secret_refs config
+                                    entries; trusted config only)
     --inherit-env / --no-inherit-env
                                     Inherit the full host environment (default: off —
                                     only a safe allowlist is passed)
@@ -232,6 +249,23 @@ pub struct CliArgs {
     /// the sandbox sees a placeholder; the proxy substitutes the real
     /// value only for requests terminating at `host`.
     pub secrets: Vec<(String, String)>,
+    /// Secret-provider mode (`--secret-provider`): bare `NAME` entries
+    /// in env_pass are fetched from the configured vault on the host
+    /// and spliced in as explicit `NAME=VALUE` entries before the
+    /// sandbox starts.
+    pub use_secret_provider: bool,
+    /// Provider backend (`--secret-provider-type`): "onepassword"/"op"
+    /// or "openbao"/"bao", parsed at use time.
+    pub secret_provider_type: Option<String>,
+    /// Provider server root (`--secret-provider-url`),
+    /// `scheme://host[:port]`.
+    pub secret_provider_url: Option<String>,
+    /// Optional PEM CA bundle for the provider URL
+    /// (`--secret-provider-ca`).
+    pub secret_provider_ca: Option<PathBuf>,
+    /// Provider references (`--secret-ref KEY=REF`, repeatable): a bare
+    /// `NAME` env entry resolves through this allowlist.
+    pub secret_refs: Vec<(String, String)>,
     pub env: Vec<String>,
     pub exec: bool,
     pub clean: bool,
@@ -552,6 +586,33 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 }
                 args.secrets.push((key.to_string(), host.to_string()));
             }
+            Long("secret-provider") => args.use_secret_provider = true,
+            Long("secret-provider-type") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                args.secret_provider_type =
+                    Some(val.to_string_lossy().into_owned());
+            }
+            Long("secret-provider-url") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                args.secret_provider_url =
+                    Some(val.to_string_lossy().into_owned());
+            }
+            Long("secret-provider-ca") => {
+                let val: PathBuf =
+                    parser.value().map_err(|e| e.to_string())?.into();
+                args.secret_provider_ca = Some(val);
+            }
+            Long("secret-ref") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let s = val.to_string_lossy();
+                let Some((key, r)) = s.split_once('=') else {
+                    return Err("--secret-ref requires KEY=REF".into());
+                };
+                if key.is_empty() || r.is_empty() {
+                    return Err("--secret-ref requires KEY=REF".into());
+                }
+                args.secret_refs.push((key.to_string(), r.to_string()));
+            }
             Long(s @ ("worktree" | "no-worktree")) => {
                 args.worktree = Some(s == "worktree");
             }
@@ -834,6 +895,11 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--env",
     "--env-from-file",
     "--secret",
+    "--secret-provider",
+    "--secret-provider-type",
+    "--secret-provider-url",
+    "--secret-provider-ca",
+    "--secret-ref",
     "--mise",
     "--no-mise",
     "--toolchains",
@@ -2236,6 +2302,84 @@ mod tests {
         assert!(parse_test(&["--secret"]).is_err());
         let error =
             parse_test(&["claude", "--secret", "K=example.com"]).unwrap_err();
+        assert!(error.contains("after command"));
+    }
+
+    #[test]
+    fn parse_secret_provider_switch() {
+        let args = parse_test(&["--secret-provider", "claude"]).unwrap();
+        assert!(args.use_secret_provider);
+        assert_eq!(args.secret_provider_type, None);
+        assert_eq!(args.secret_provider_url, None);
+        assert_eq!(args.secret_provider_ca, None);
+        assert!(args.secret_refs.is_empty());
+
+        let args = parse_test(&["bash"]).unwrap();
+        assert!(!args.use_secret_provider);
+    }
+
+    #[test]
+    fn parse_secret_provider_type_url_and_ca() {
+        let args = parse_test(&[
+            "--secret-provider-type",
+            "openbao",
+            "--secret-provider-url=https://bao.internal:8200",
+            "--secret-provider-ca",
+            "/etc/bao-ca.pem",
+            "claude",
+        ])
+        .unwrap();
+        assert_eq!(args.secret_provider_type.as_deref(), Some("openbao"));
+        assert_eq!(
+            args.secret_provider_url.as_deref(),
+            Some("https://bao.internal:8200")
+        );
+        assert_eq!(
+            args.secret_provider_ca,
+            Some(PathBuf::from("/etc/bao-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn parse_secret_provider_type_url_and_ca_missing_value_errors() {
+        assert!(parse_test(&["--secret-provider-type"]).is_err());
+        assert!(parse_test(&["--secret-provider-url"]).is_err());
+        assert!(parse_test(&["--secret-provider-ca"]).is_err());
+    }
+
+    #[test]
+    fn parse_secret_ref_repeatable_and_strict() {
+        let args = parse_test(&[
+            "--secret-ref",
+            "ANTHROPIC_API_KEY=Dev/Anthropic/credential",
+            "--secret-ref=OPENAI_API_KEY=secret/ai/openai#api_key",
+            "claude",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.secret_refs,
+            vec![
+                (
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "Dev/Anthropic/credential".to_string()
+                ),
+                (
+                    "OPENAI_API_KEY".to_string(),
+                    "secret/ai/openai#api_key".to_string()
+                ),
+            ]
+        );
+        for bad in ["KEY", "=Dev/Item/field", "KEY="] {
+            assert!(
+                parse_test(&["--secret-ref", bad])
+                    .unwrap_err()
+                    .contains("KEY=REF"),
+                "{bad}"
+            );
+        }
+        assert!(parse_test(&["--secret-ref"]).is_err());
+        let error = parse_test(&["claude", "--secret-ref", "K=Dev/Item/f"])
+            .unwrap_err();
         assert!(error.contains("after command"));
     }
 

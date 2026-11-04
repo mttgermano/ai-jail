@@ -361,6 +361,34 @@ pub struct Config {
     /// Never serialized: it names which variables are secrets.
     #[serde(default, skip_serializing)]
     pub secret_hosts: std::collections::BTreeMap<String, String>,
+    /// Secret-provider backend for `--secret-provider`
+    /// (`--secret-provider-type`): "onepassword"/"op" or
+    /// "openbao"/"bao". Stored as a string and parsed at use time, so
+    /// an old binary reading a config written by a newer one (with a
+    /// type it does not know) still loads. Trusted layers only — the
+    /// project `.ai-jail` is ignored. Never serialized.
+    #[serde(default, skip_serializing)]
+    pub secrets_provider_type: Option<String>,
+    /// Secret-provider server root (`--secret-provider-url`),
+    /// `scheme://host[:port]`; https is required except for loopback
+    /// hosts. Trusted layers only — the project `.ai-jail` is ignored.
+    /// Never serialized.
+    #[serde(default, skip_serializing)]
+    pub secrets_provider_url: Option<String>,
+    /// Optional PEM CA bundle for the provider URL
+    /// (`--secret-provider-ca`). Trusted layers only — the project
+    /// `.ai-jail` is ignored. Never serialized.
+    #[serde(default, skip_serializing)]
+    pub secrets_provider_ca: Option<PathBuf>,
+    /// Provider references for `--secret-provider`:
+    /// `NAME = "ref"` — a bare `NAME` entry in env_pass is fetched from
+    /// the provider using this ref (1Password `Vault/Item/field`,
+    /// OpenBao `mount/path#field`) instead of copying the local
+    /// environment. Trusted layers only — the project `.ai-jail` is
+    /// ignored. Never serialized: it names which variables are vault
+    /// secrets.
+    #[serde(default, skip_serializing)]
+    pub secret_refs: std::collections::BTreeMap<String, String>,
     /// Directories whose project `.ai-jail` is trusted to grant
     /// capabilities, instead of being treated as untrusted monotonic
     /// policy. A project matches when it is one of these directories or
@@ -1183,6 +1211,12 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     c.env_from_file.extend(local.env_from_file);
     dedup_paths(&mut c.env_from_file);
     c.secret_hosts.extend(local.secret_hosts);
+    // Secret-provider scalars: a command table may override just the
+    // url and keep the global type, so each is taken separately.
+    take!(secrets_provider_type);
+    take!(secrets_provider_url);
+    take!(secrets_provider_ca);
+    c.secret_refs.extend(local.secret_refs);
     c.allow_tcp_ports.extend(local.allow_tcp_ports);
     c.allow_tcp_ports.sort_unstable();
     c.allow_tcp_ports.dedup();
@@ -1563,6 +1597,30 @@ pub fn merge_with_global_report(
     if !local.secret_hosts.is_empty() {
         warnings.push(
             "project .ai-jail secret_hosts ignored (use --secret or global config)"
+                .into(),
+        );
+    }
+    if local.secrets_provider_type.is_some() {
+        warnings.push(
+            "project .ai-jail secrets_provider_type ignored (use --secret-provider-type or global config)"
+                .into(),
+        );
+    }
+    if local.secrets_provider_url.is_some() {
+        warnings.push(
+            "project .ai-jail secrets_provider_url ignored (use --secret-provider-url or global config)"
+                .into(),
+        );
+    }
+    if local.secrets_provider_ca.is_some() {
+        warnings.push(
+            "project .ai-jail secrets_provider_ca ignored (use --secret-provider-ca or global config)"
+                .into(),
+        );
+    }
+    if !local.secret_refs.is_empty() {
+        warnings.push(
+            "project .ai-jail secret_refs ignored (use --secret-ref or global config)"
                 .into(),
         );
     }
@@ -2154,6 +2212,21 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
         config.secret_hosts.insert(key.clone(), host.clone());
     }
 
+    // Secret-provider settings: each CLI Some overrides the config
+    // value; --secret-ref pairs extend the config allowlist.
+    if let Some(ref v) = cli.secret_provider_type {
+        config.secrets_provider_type = Some(v.clone());
+    }
+    if let Some(ref v) = cli.secret_provider_url {
+        config.secrets_provider_url = Some(v.clone());
+    }
+    if let Some(ref v) = cli.secret_provider_ca {
+        config.secrets_provider_ca = Some(v.clone());
+    }
+    for (key, r) in &cli.secret_refs {
+        config.secret_refs.insert(key.clone(), r.clone());
+    }
+
     if let Some(p) = cli.claude_dir.clone() {
         config.claude_dir = Some(p);
     }
@@ -2182,6 +2255,9 @@ fn expand_user_paths(config: &mut Config) {
     expand_tilde_vec(&mut config.mask_exceptions);
     expand_tilde_vec(&mut config.deny_path_exceptions);
     expand_tilde_vec(&mut config.env_from_file);
+    if let Some(p) = config.secrets_provider_ca.take() {
+        config.secrets_provider_ca = Some(expand_tilde(p));
+    }
     if let Some(p) = config.claude_dir.take() {
         config.claude_dir = Some(expand_tilde(p));
     }
@@ -2284,6 +2360,7 @@ pub fn display_status(config: &Config) {
     print_opt_in_enabled("  Full env inherit", config.inherit_env);
     print_string_list("  Env passthrough", &config.env_pass);
     print_path_list("  Env from file", &config.env_from_file);
+    print_secret_provider(config);
     print_opt_in_enabled("  Update check", config.update_check);
     print_opt_in_enabled("  Audit log", config.audit_log);
     print_opt_in_tristate("  Git worktree", config.no_worktree);
@@ -2338,6 +2415,43 @@ fn print_string_list(label: &str, strings: &[String]) {
         return;
     }
     output::status_header(label, &strings.join(", "));
+}
+
+/// `ai-jail status` view of the secret provider: one compact line for
+/// type + URL host (never the scheme, port, or any query), one for the
+/// ref KEY NAMES only — never a ref value, so no vault path of a
+/// sensitive item lands in terminal scrollback either.
+fn print_secret_provider(config: &Config) {
+    if config.secrets_provider_type.is_some()
+        || config.secrets_provider_url.is_some()
+    {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(kind) = &config.secrets_provider_type {
+            parts.push(kind.clone());
+        }
+        if let Some(url) = &config.secrets_provider_url {
+            let host = match crate::secret_provider::parse_url(url) {
+                Ok(base) => base.host,
+                Err(_) => {
+                    // Invalid URL (the launch would refuse it): show
+                    // the text without scheme, path, or query.
+                    let noscheme =
+                        url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+                    noscheme
+                        .split(['/', '?', '#'])
+                        .next()
+                        .unwrap_or(noscheme)
+                        .to_string()
+                }
+            };
+            parts.push(host);
+        }
+        output::status_header("  Secrets provider", &parts.join(" at "));
+    }
+    if !config.secret_refs.is_empty() {
+        let keys: Vec<String> = config.secret_refs.keys().cloned().collect();
+        output::status_header("  Secret refs", &keys.join(", "));
+    }
 }
 
 /// Render a `no_*` field with the default-off convention:
@@ -4167,6 +4281,10 @@ no_gpu = true
             )]
             .into_iter()
             .collect(),
+            secrets_provider_type: None,
+            secrets_provider_url: None,
+            secrets_provider_ca: None,
+            secret_refs: Default::default(),
             trust_project_config: vec![],
             update_check: Some(false),
             audit_log: Some(true),
@@ -6228,6 +6346,23 @@ env_from_file = ["/run/secrets/anthropic"]
     }
 
     #[test]
+    fn regression_v2_15_0_config_without_secret_provider_fields() {
+        // Configs written before the secret provider existed must still
+        // parse, defaulting to no provider and no refs.
+        let toml = r#"
+command = ["claude"]
+env_pass = ["ANTHROPIC_API_KEY"]
+env_from_file = ["/run/secrets/anthropic"]
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert!(cfg.secret_hosts.is_empty());
+        assert!(cfg.secrets_provider_type.is_none());
+        assert!(cfg.secrets_provider_url.is_none());
+        assert!(cfg.secrets_provider_ca.is_none());
+        assert!(cfg.secret_refs.is_empty());
+    }
+
+    #[test]
     fn regression_v2_1_0_config_without_secret_hosts() {
         // Configs written before secret_hosts existed must still parse,
         // defaulting to no phantom bindings.
@@ -6307,6 +6442,179 @@ ANTHROPIC_API_KEY = "api.anthropic.com"
         );
         assert!(merged.secret_hosts.is_empty());
         assert!(warnings.iter().any(|w| w.contains("secret_hosts")));
+    }
+
+    #[test]
+    fn project_secret_provider_fields_are_ignored_with_warning() {
+        let mut project = Config::default();
+        project.secrets_provider_type = Some("openbao".into());
+        project.secrets_provider_url = Some("https://bao.internal:8200".into());
+        project.secrets_provider_ca = Some(PathBuf::from("/etc/bao-ca.pem"));
+        project
+            .secret_refs
+            .insert("KEY".into(), "secret/ai/k#value".into());
+        let (merged, warnings) = merge_with_global_report(
+            Config::default(),
+            project,
+            Path::new("/project"),
+        );
+        assert!(merged.secrets_provider_type.is_none());
+        assert!(merged.secrets_provider_url.is_none());
+        assert!(merged.secrets_provider_ca.is_none());
+        assert!(merged.secret_refs.is_empty());
+        for field in [
+            "secrets_provider_type",
+            "secrets_provider_url",
+            "secrets_provider_ca",
+            "secret_refs",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w.contains(field)),
+                "no warning for {field}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_project_may_set_secret_provider_fields() {
+        // A project config under the global trust_project_config merges
+        // with trusted semantics: the provider fields are taken, not
+        // ignored with a warning.
+        let mut global = Config::default();
+        global.trust_project_config = vec![PathBuf::from("/trusted")];
+        let mut project = Config::default();
+        project.secrets_provider_type = Some("openbao".into());
+        project.secrets_provider_url = Some("https://bao.internal:8200".into());
+        project
+            .secret_refs
+            .insert("KEY".into(), "secret/ai/k#value".into());
+        let merged = merge_trusted_project(global, project);
+        assert_eq!(merged.secrets_provider_type.as_deref(), Some("openbao"));
+        assert_eq!(
+            merged.secrets_provider_url.as_deref(),
+            Some("https://bao.internal:8200")
+        );
+        assert_eq!(
+            merged.secret_refs.get("KEY").map(String::as_str),
+            Some("secret/ai/k#value")
+        );
+    }
+
+    #[test]
+    fn secret_provider_fields_are_never_serialized() {
+        let mut config = Config::default();
+        config.secrets_provider_type = Some("onepassword".into());
+        config.secrets_provider_url = Some("https://op.internal:8080".into());
+        config.secrets_provider_ca = Some(PathBuf::from("/etc/op-ca.pem"));
+        config
+            .secret_refs
+            .insert("KEY".into(), "Dev/Item/field".into());
+        let serialized = serialize_config(&config).unwrap();
+        for field in [
+            "secrets_provider_type",
+            "secrets_provider_url",
+            "secrets_provider_ca",
+            "secret_refs",
+        ] {
+            assert!(
+                !serialized.contains(field),
+                "{field} leaked into the serialized config: {serialized}"
+            );
+        }
+        // A round-trip through disk loses them, like env_pass.
+        let reparsed = parse_toml(&serialized).unwrap();
+        assert!(reparsed.secrets_provider_type.is_none());
+        assert!(reparsed.secrets_provider_url.is_none());
+        assert!(reparsed.secrets_provider_ca.is_none());
+        assert!(reparsed.secret_refs.is_empty());
+    }
+
+    #[test]
+    fn command_table_overrides_secrets_provider_url_only() {
+        let mut global = Config::default();
+        global.secrets_provider_type = Some("openbao".into());
+        global.secrets_provider_url =
+            Some("https://global.bao.internal:8200".into());
+        let mut table = Config::default();
+        table.secrets_provider_url =
+            Some("https://claude.bao.internal:8200".into());
+        let merged = merge_with_global(global, table);
+        // The scalar type survives the table's url-only override.
+        assert_eq!(merged.secrets_provider_type.as_deref(), Some("openbao"));
+        assert_eq!(
+            merged.secrets_provider_url.as_deref(),
+            Some("https://claude.bao.internal:8200")
+        );
+    }
+
+    #[test]
+    fn command_table_secret_refs_merge_extends() {
+        let mut global = Config::default();
+        global
+            .secret_refs
+            .insert("A_KEY".into(), "secret/ai/a#value".into());
+        let mut table = Config::default();
+        table
+            .secret_refs
+            .insert("B_KEY".into(), "secret/ai/b#value".into());
+        let merged = merge_with_global(global, table);
+        assert_eq!(merged.secret_refs.len(), 2);
+        assert_eq!(
+            merged.secret_refs.get("B_KEY").map(String::as_str),
+            Some("secret/ai/b#value")
+        );
+    }
+
+    #[test]
+    fn cli_overrides_secret_provider_fields() {
+        let mut config = Config::default();
+        config.secrets_provider_type = Some("openbao".into());
+        config.secrets_provider_url =
+            Some("https://config.bao.internal:8200".into());
+        config.secrets_provider_ca = Some(PathBuf::from("/config-ca.pem"));
+        config
+            .secret_refs
+            .insert("A_KEY".into(), "secret/ai/a#value".into());
+        let cli = CliArgs {
+            secret_provider_type: Some("onepassword".into()),
+            secret_provider_url: Some("https://cli.op.internal:8080".into()),
+            secret_provider_ca: Some(PathBuf::from("/cli-ca.pem")),
+            secret_refs: vec![("B_KEY".into(), "Dev/Item/field".into())],
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, config);
+        assert_eq!(
+            merged.secrets_provider_type.as_deref(),
+            Some("onepassword")
+        );
+        assert_eq!(
+            merged.secrets_provider_url.as_deref(),
+            Some("https://cli.op.internal:8080")
+        );
+        assert_eq!(
+            merged.secrets_provider_ca,
+            Some(PathBuf::from("/cli-ca.pem"))
+        );
+        assert_eq!(merged.secret_refs.len(), 2);
+        assert_eq!(
+            merged.secret_refs.get("B_KEY").map(String::as_str),
+            Some("Dev/Item/field")
+        );
+    }
+
+    #[test]
+    fn secret_provider_ca_tilde_expands() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set("HOME", "/home/testuser");
+        let cli = CliArgs {
+            secret_provider_ca: Some(PathBuf::from("~/ca.pem")),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, Config::default());
+        assert_eq!(
+            merged.secrets_provider_ca,
+            Some(PathBuf::from("/home/testuser/ca.pem"))
+        );
     }
 
     #[test]
@@ -7418,6 +7726,10 @@ hide_dotdirs = [".my_secrets"]
             env_pass: vec![],
             env_from_file: vec![],
             secret_hosts: Default::default(),
+            secrets_provider_type: None,
+            secrets_provider_url: None,
+            secrets_provider_ca: None,
+            secret_refs: Default::default(),
             trust_project_config: vec![],
             update_check: None,
             audit_log: None,

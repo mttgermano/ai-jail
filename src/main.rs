@@ -246,6 +246,153 @@ fn prepare_secrets(
     Ok(bindings)
 }
 
+/// The provider token name is reserved. It must never travel into the
+/// sandbox through env_pass: a bare entry would copy the token out of
+/// the host environment and an explicit entry would carry it verbatim.
+/// Refused unconditionally — flag or no flag — after --env-from-file
+/// entries have been merged in, so a credential file cannot smuggle it
+/// either.
+fn reject_provider_token_env_entry(
+    config: &config::Config,
+) -> Result<(), String> {
+    for entry in &config.env_pass {
+        if let Ok((name, _)) = config::parse_env_entry(entry)
+            && name == "AI_JAIL_SECRET_TOKEN"
+        {
+            return Err(
+                "AI_JAIL_SECRET_TOKEN is reserved for --secret-provider and \
+                 cannot be passed into the sandbox via --env/env_pass"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Read the provider token from the supervisor's environment and remove
+/// it immediately: the token must never reach the jail, and this runs
+/// single-threaded before the proxy and PTY start, so `--inherit-env`
+/// cannot copy a variable that is already gone. A missing or empty
+/// token is a launch error naming the hint.
+fn read_and_clear_token() -> Result<String, String> {
+    const HINT: &str = "export AI_JAIL_SECRET_TOKEN=<provider token>";
+    let token = match std::env::var("AI_JAIL_SECRET_TOKEN") {
+        Ok(token) => token,
+        Err(_) => {
+            return Err(format!("AI_JAIL_SECRET_TOKEN is not set: {HINT}"));
+        }
+    };
+    // Edition 2024: process-global env mutation is unsafe by contract.
+    unsafe { std::env::remove_var("AI_JAIL_SECRET_TOKEN") };
+    if token.is_empty() {
+        return Err(format!("AI_JAIL_SECRET_TOKEN is empty: {HINT}"));
+    }
+    Ok(token)
+}
+
+/// `--secret-provider`: resolve bare `NAME` entries in `env_pass`
+/// against the configured vault, on the host, before the sandbox
+/// starts. `fetch` is injected so tests can fake the provider.
+///
+/// Resolution, in order, each step failing closed:
+/// 1. flag off → nothing happens (today's local-env behavior).
+/// 2. provider type and url must both be configured (config key or CLI
+///    flag), even when no key is wanted.
+/// 3. wanted keys are the bare `NAME` entries whose name is in
+///    `secret_refs`, first occurrence first, deduplicated — one fetch
+///    rewrites every matching entry. Literal `NAME=VALUE` entries
+///    (including every `--env-from-file` line, which always carries a
+///    value) are never looked up.
+/// 4. no wanted keys → one-line note, nothing fetched.
+/// 5. every ref is validated before any request is made.
+/// 6. `--dry-run` prints what would be fetched and stops: no token
+///    read, no request.
+/// 7. one fetch call for the whole batch; any failure aborts the
+///    launch. A key asked from the provider never falls back to the
+///    local environment.
+/// 8. matching entries are rewritten in place to `NAME=VALUE`, order
+///    preserved, so apply_env_pass's later-entry-wins rule and
+///    prepare_secrets phantomization keep working.
+fn apply_secret_provider(
+    config: &mut config::Config,
+    use_provider: bool,
+    dry_run: bool,
+    fetch: &dyn Fn(
+        crate::secret_provider::Kind,
+        &crate::secret_provider::Base,
+        &[(String, String)],
+    ) -> Result<Vec<(String, String)>, String>,
+) -> Result<(), String> {
+    if !use_provider {
+        return Ok(());
+    }
+    let Some(type_text) = config.secrets_provider_type.as_deref() else {
+        return Err("--secret-provider needs a provider type: pass \
+             --secret-provider-type <TYPE> or set secrets_provider_type \
+             in the global config"
+            .into());
+    };
+    let Some(url) = config.secrets_provider_url.as_deref() else {
+        return Err("--secret-provider needs a provider URL: pass \
+             --secret-provider-url <URL> or set secrets_provider_url \
+             in the global config"
+            .into());
+    };
+    let kind = crate::secret_provider::Kind::parse(type_text)?;
+    let base = crate::secret_provider::parse_url(url)?;
+
+    // Wanted keys: bare env entries named in secret_refs,
+    // first-occurrence order, deduplicated.
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in &config.env_pass {
+        let Ok((name, None)) = config::parse_env_entry(entry) else {
+            continue;
+        };
+        let Some(r) = config.secret_refs.get(name) else {
+            continue;
+        };
+        if seen.insert(name.to_string()) {
+            wanted.push((name.to_string(), r.clone()));
+        }
+    }
+    if wanted.is_empty() {
+        output::info(
+            "secret provider: no requested keys are in secret_refs; \
+             nothing fetched",
+        );
+        return Ok(());
+    }
+    for (key, r) in &wanted {
+        crate::secret_provider::validate_ref(kind, r)
+            .map_err(|e| format!("--env {key}: {e}"))?;
+    }
+    if dry_run {
+        for (key, r) in &wanted {
+            output::info(&format!(
+                "secret provider (dry run): would fetch {key} from {r:?}"
+            ));
+        }
+        return Ok(());
+    }
+    let fetched: std::collections::BTreeMap<String, String> =
+        fetch(kind, &base, &wanted)?.into_iter().collect();
+    // Rewrite every bare entry whose name was fetched, in place:
+    // duplicates all become explicit and the entry order is preserved.
+    for entry in config.env_pass.iter_mut() {
+        let replacement = match config::parse_env_entry(entry) {
+            Ok((name, None)) => {
+                fetched.get(name).map(|value| format!("{name}={value}"))
+            }
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            *entry = replacement;
+        }
+    }
+    Ok(())
+}
+
 /// Test-only escape hatches, compiled in ONLY under the `test-hooks` feature.
 /// A default build (release, `cargo install`, CI without the feature) gets the
 /// inert fallbacks below, so neither the env-var reads nor their strings exist
@@ -1113,6 +1260,33 @@ fn run() -> Result<i32, String> {
         config.env_pass = env_pass;
     }
 
+    // The provider token name is reserved (see
+    // reject_provider_token_env_entry): refused whether or not
+    // --secret-provider is used, and after --env-from-file entries are
+    // merged in, so a credential file cannot smuggle it either.
+    reject_provider_token_env_entry(&config)?;
+
+    // --secret-provider: resolve bare --env NAME entries from the
+    // configured vault on the host, before anything else can observe
+    // the supervisor's environment. The token is read and removed from
+    // this process's environment inside the fetch closure — still
+    // single-threaded here, before the proxy and PTY start, so
+    // --inherit-env cannot copy it into the sandbox.
+    let ca = config.secrets_provider_ca.clone();
+    let fetch = |kind: crate::secret_provider::Kind,
+                 base: &crate::secret_provider::Base,
+                 wanted: &[(String, String)]|
+     -> Result<Vec<(String, String)>, String> {
+        let token = read_and_clear_token()?;
+        crate::secret_provider::fetch(kind, base, ca.as_deref(), &token, wanted)
+    };
+    apply_secret_provider(
+        &mut config,
+        cli.use_secret_provider,
+        cli.dry_run,
+        &fetch,
+    )?;
+
     // The GitHub config directory may live under GH_CONFIG_DIR or
     // XDG_CONFIG_HOME, and its active token may live in the host keyring.
     // Resolve both after --env-from-file is applied, but never fetch a token
@@ -1529,11 +1703,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_browser_profile, browser_display_hint, command_is_browser,
-        command_needs_direct_tty, default_agent_api_egress_applies,
-        default_registry_egress_applies, default_resize_redraw_key,
-        exec_requires_terminal_passthrough, internal_mode_inherits_quiet,
-        prune_missing_path_entries, pty_proxy_active, resolve_browser_profile,
+        apply_browser_profile, apply_secret_provider, browser_display_hint,
+        command_is_browser, command_needs_direct_tty,
+        default_agent_api_egress_applies, default_registry_egress_applies,
+        default_resize_redraw_key, exec_requires_terminal_passthrough,
+        internal_mode_inherits_quiet, prune_missing_path_entries,
+        pty_proxy_active, read_and_clear_token,
+        reject_provider_token_env_entry, resolve_browser_profile,
         running_inside_multiplexer, should_auto_save_project_config,
         should_check_update, should_save_global_preferences,
         untrusted_project_command_carries_credentials, validate_network_flags,
@@ -1541,7 +1717,33 @@ mod tests {
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
+    use crate::secret_provider::{Base, Kind};
     use crate::test_utils::{ENV_LOCK, EnvVarGuard};
+
+    type FetchResult = Result<Vec<(String, String)>, String>;
+
+    /// A provider-configured config: OpenBao on loopback http.
+    fn provider_config() -> Config {
+        Config {
+            secrets_provider_type: Some("openbao".into()),
+            secrets_provider_url: Some("http://127.0.0.1:8200".into()),
+            ..Config::default()
+        }
+    }
+
+    /// A fetch fake that records how often it was called and answers
+    /// every wanted key with `value-for-<KEY>`.
+    fn recording_fetch<'a>(
+        calls: &'a std::cell::Cell<usize>,
+    ) -> impl Fn(Kind, &Base, &[(String, String)]) -> FetchResult + 'a {
+        move |_kind, _base, wanted| {
+            calls.set(calls.get() + 1);
+            Ok(wanted
+                .iter()
+                .map(|(key, _)| (key.clone(), format!("value-for-{key}")))
+                .collect())
+        }
+    }
 
     #[test]
     fn internal_modes_inherit_quiet_output() {
@@ -1975,6 +2177,236 @@ mod tests {
                 .contains("named in --env but not set in the host environment")
         );
         assert_eq!(config.env_pass, vec![key]);
+    }
+
+    #[test]
+    fn secret_provider_flag_off_leaves_env_pass_alone() {
+        // Flag off is today's behavior: bare entries keep resolving
+        // against the local environment, refs are ignored, no fetch.
+        let mut config = provider_config();
+        config.env_pass = vec!["KEY".into()];
+        config
+            .secret_refs
+            .insert("KEY".into(), "secret/ai/k#value".into());
+        let calls = std::cell::Cell::new(0_usize);
+        let fetch = recording_fetch(&calls);
+        apply_secret_provider(&mut config, false, false, &fetch).unwrap();
+        assert_eq!(config.env_pass, vec!["KEY"]);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn secret_provider_requires_type_and_url() {
+        // Missing type: named, with how to set it, even with no wanted
+        // keys.
+        let mut config = Config {
+            secrets_provider_url: Some("http://127.0.0.1:8200".into()),
+            env_pass: vec!["KEY".into()],
+            secret_refs: [("KEY".into(), "secret/ai/k#value".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
+        let calls = std::cell::Cell::new(0_usize);
+        let fetch = recording_fetch(&calls);
+        let error = apply_secret_provider(&mut config, true, false, &fetch)
+            .unwrap_err();
+        assert!(error.contains("type"), "{error}");
+        assert!(error.contains("secrets_provider_type"), "{error}");
+
+        // Missing url: same treatment.
+        let mut config = Config {
+            secrets_provider_type: Some("openbao".into()),
+            ..Config::default()
+        };
+        let error = apply_secret_provider(&mut config, true, false, &fetch)
+            .unwrap_err();
+        assert!(error.contains("URL"), "{error}");
+        assert!(error.contains("secrets_provider_url"), "{error}");
+    }
+
+    #[test]
+    fn secret_provider_rewrites_only_bare_ref_entries() {
+        // Bare KEY (in refs) is fetched and rewritten; the literal
+        // KEY=explicit entry, the bare OTHER (not in refs), and the
+        // explicit-without-ref entry are all untouched. Order is
+        // preserved.
+        let mut config = provider_config();
+        config.env_pass = vec![
+            "KEY".into(),
+            "OTHER".into(),
+            "KEY=explicit".into(),
+            "LITERAL=plain".into(),
+        ];
+        config.secret_refs = [
+            ("KEY".into(), "secret/ai/k#value".into()),
+            // A ref without a matching --env request: never fetched.
+            ("EXTRA".into(), "secret/ai/e#value".into()),
+        ]
+        .into_iter()
+        .collect();
+        let calls = std::cell::Cell::new(0_usize);
+        let fetch = recording_fetch(&calls);
+        apply_secret_provider(&mut config, true, false, &fetch).unwrap();
+        assert_eq!(
+            config.env_pass,
+            vec![
+                "KEY=value-for-KEY".to_string(),
+                "OTHER".to_string(),
+                "KEY=explicit".to_string(),
+                "LITERAL=plain".to_string(),
+            ]
+        );
+        // One fetch for the whole batch, KEY only.
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn secret_provider_duplicate_bare_entries_all_rewritten() {
+        let mut config = provider_config();
+        config.env_pass = vec!["KEY".into(), "OTHER".into(), "KEY".into()];
+        config
+            .secret_refs
+            .insert("KEY".into(), "secret/ai/k#value".into());
+        let calls = std::cell::Cell::new(0_usize);
+        let fetch = recording_fetch(&calls);
+        apply_secret_provider(&mut config, true, false, &fetch).unwrap();
+        assert_eq!(
+            config.env_pass,
+            vec![
+                "KEY=value-for-KEY".to_string(),
+                "OTHER".to_string(),
+                "KEY=value-for-KEY".to_string(),
+            ]
+        );
+        // Deduplicated: fetched once, rewritten everywhere.
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn secret_provider_refs_without_matching_env_never_fetch() {
+        // Refs exist but no bare env entry names them: nothing wanted,
+        // no fetch, launch proceeds.
+        let mut config = provider_config();
+        config.env_pass = vec!["KEY=explicit".into()];
+        config
+            .secret_refs
+            .insert("KEY".into(), "secret/ai/k#value".into());
+        let calls = std::cell::Cell::new(0_usize);
+        let fetch = recording_fetch(&calls);
+        apply_secret_provider(&mut config, true, false, &fetch).unwrap();
+        assert_eq!(calls.get(), 0);
+        assert_eq!(config.env_pass, vec!["KEY=explicit"]);
+    }
+
+    #[test]
+    fn secret_provider_fetch_error_propagates_no_local_fallback() {
+        let mut config = provider_config();
+        config.env_pass = vec!["KEY".into()];
+        config
+            .secret_refs
+            .insert("KEY".into(), "secret/ai/k#value".into());
+        let fetch = |_kind: Kind, _base: &Base, _w: &[(String, String)]| {
+            Err("provider down".to_string())
+        };
+        let error = apply_secret_provider(&mut config, true, false, &fetch)
+            .unwrap_err();
+        assert!(error.contains("provider down"), "{error}");
+        // The bare entry is NOT silently left to fall back later: the
+        // launch aborts, but the config was not rewritten either.
+        assert_eq!(config.env_pass, vec!["KEY"]);
+    }
+
+    #[test]
+    fn secret_provider_dry_run_never_fetches() {
+        let mut config = provider_config();
+        config.env_pass = vec!["KEY".into()];
+        config
+            .secret_refs
+            .insert("KEY".into(), "secret/ai/k#value".into());
+        let calls = std::cell::Cell::new(0_usize);
+        let fetch = recording_fetch(&calls);
+        apply_secret_provider(&mut config, true, true, &fetch).unwrap();
+        assert_eq!(calls.get(), 0);
+        assert_eq!(config.env_pass, vec!["KEY"]);
+    }
+
+    #[test]
+    fn read_and_clear_token_returns_and_removes() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("AI_JAIL_SECRET_TOKEN", "tok-123");
+        let token = read_and_clear_token().unwrap();
+        assert_eq!(token, "tok-123");
+        // Removed from the supervisor environment immediately: it can
+        // never be copied into the sandbox.
+        assert!(std::env::var("AI_JAIL_SECRET_TOKEN").is_err());
+        // EnvVarGuard restores the saved value (none) on drop.
+    }
+
+    #[test]
+    fn read_and_clear_token_refuses_missing_and_empty() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let _absent = EnvVarGuard::remove("AI_JAIL_SECRET_TOKEN");
+        let error = read_and_clear_token().unwrap_err();
+        assert!(
+            error.contains("export AI_JAIL_SECRET_TOKEN=<provider token>"),
+            "{error}"
+        );
+        let _empty = EnvVarGuard::set("AI_JAIL_SECRET_TOKEN", "");
+        let error = read_and_clear_token().unwrap_err();
+        assert!(error.contains("empty"), "{error}");
+    }
+
+    #[test]
+    fn env_pass_may_not_carry_the_provider_token() {
+        for entry in ["AI_JAIL_SECRET_TOKEN", "AI_JAIL_SECRET_TOKEN=x"] {
+            let config = Config {
+                env_pass: vec![entry.into()],
+                ..Config::default()
+            };
+            let error = reject_provider_token_env_entry(&config).unwrap_err();
+            assert!(error.contains("AI_JAIL_SECRET_TOKEN"), "{entry}: {error}");
+        }
+        let clean = Config {
+            env_pass: vec!["OTHER".into(), "OTHER=x".into()],
+            ..Config::default()
+        };
+        assert!(reject_provider_token_env_entry(&clean).is_ok());
+    }
+
+    #[test]
+    fn secret_provider_fetch_then_phantomize_keeps_value_out_of_the_jail() {
+        // The documented --secret composition: the fetched value is
+        // spliced into env_pass, then prepare_secrets swaps it for a
+        // placeholder, so the sandbox sees neither the vault value nor
+        // anything local.
+        let mut config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            env_pass: vec!["KEY".into()],
+            secret_hosts: [("KEY".into(), "api.anthropic.com".into())]
+                .into_iter()
+                .collect(),
+            secrets_provider_type: Some("openbao".into()),
+            secrets_provider_url: Some("http://127.0.0.1:8200".into()),
+            secret_refs: [("KEY".into(), "secret/ai/k#value".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
+        let fetch = |_kind: Kind, _base: &Base, _w: &[(String, String)]| {
+            Ok(vec![("KEY".into(), "real-fetched-value".into())])
+        };
+        apply_secret_provider(&mut config, true, false, &fetch).unwrap();
+        assert_eq!(config.env_pass, vec!["KEY=real-fetched-value"]);
+        let bindings = super::prepare_secrets(&mut config).unwrap();
+        assert_eq!(bindings.len(), 1);
+        let entry = config
+            .env_pass
+            .iter()
+            .find(|e| e.starts_with("KEY="))
+            .unwrap();
+        assert!(entry.ends_with(&bindings[0].placeholder));
+        assert!(!entry.contains("real-fetched-value"));
     }
 
     #[test]
