@@ -304,20 +304,75 @@ pub fn fetch(
 
 /// OpenBao KV v2 backend: ref `mount/path#field` →
 /// `GET /v1/<mount>/data/<path>` → `.data.data.<field>`, which must be
-/// a JSON string. Header `X-Vault-Token: <token>`.
-///
-/// TODO(openbao): implement. Shared helpers available:
-/// `http_get_json`, `percent_encode`, `check_value`, `err_ctx`.
+/// a JSON string. Header `X-Vault-Token: <token>`. One short GET per
+/// key, no caching: a launch wants each key at most once. The first
+/// failure aborts the whole batch.
 fn fetch_openbao(
-    _base: &Base,
-    _ca_path: Option<&Path>,
-    _token: &str,
+    base: &Base,
+    ca_path: Option<&Path>,
+    token: &str,
     wanted: &[(String, String)],
 ) -> Result<Vec<(String, String)>, String> {
-    Err(format!(
-        "openbao backend not implemented ({} keys wanted)",
-        wanted.len()
-    ))
+    let mut out = Vec::with_capacity(wanted.len());
+    for (key, r) in wanted {
+        let Some((path, field)) = r.split_once('#') else {
+            // Refs are validated by the caller; this is belt and braces.
+            return Err(err_ctx(key, r, "secret ref is missing #field"));
+        };
+        let mut segments = path.split('/');
+        let mount = segments.next().unwrap_or_default();
+        let rest = segments.map(percent_encode).collect::<Vec<_>>();
+        let url_path =
+            format!("/v1/{}/data/{}", percent_encode(mount), rest.join("/"));
+        let body = http_get_json(
+            base,
+            ca_path,
+            &[("X-Vault-Token", token)],
+            &url_path,
+        )
+        .map_err(|e| err_ctx(key, r, &e))?;
+        out.push((key.clone(), parse_kv2_response(&body, key, r, field)?));
+    }
+    Ok(out)
+}
+
+/// Navigate a KV v2 read response to `.data.data.<field>`, which must
+/// be a JSON string, and pass it through `check_value`. Errors go
+/// through `err_ctx`: they name the env key, the ref and the failure —
+/// never the value, the token or the response body.
+fn parse_kv2_response(
+    body: &serde_json::Value,
+    key: &str,
+    r: &str,
+    field: &str,
+) -> Result<String, String> {
+    let data = body
+        .get("data")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| err_ctx(key, r, "response has no data object"))?;
+    let inner = data
+        .get("data")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| err_ctx(key, r, "response has no data.data object"))?;
+    let raw = inner
+        .get(field)
+        .ok_or_else(|| err_ctx(key, r, "field not found"))?;
+    let Some(raw) = raw.as_str() else {
+        let kind = match raw {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+            serde_json::Value::String(_) => "string",
+        };
+        return Err(err_ctx(
+            key,
+            r,
+            &format!("field {field:?} is a JSON {kind}, not a string"),
+        ));
+    };
+    check_value(raw).map_err(|e| err_ctx(key, r, &e))
 }
 
 /// 1Password Connect backend: ref `Vault/Item/field`. Each of vault
@@ -366,7 +421,19 @@ pub(crate) fn http_get_json(
     headers: &[(&str, &str)],
     path: &str,
 ) -> Result<serde_json::Value, String> {
-    let mut stream = connect(base, ca_path)?;
+    http_get_json_with(base, ca_path, headers, path, IO_TIMEOUT)
+}
+
+/// `http_get_json` with an explicit read timeout, so tests can fail
+/// fast against a stalled server instead of waiting out `IO_TIMEOUT`.
+fn http_get_json_with(
+    base: &Base,
+    ca_path: Option<&Path>,
+    headers: &[(&str, &str)],
+    path: &str,
+    read_timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let mut stream = connect(base, ca_path, read_timeout)?;
     let host_header = match base.port {
         Some(p) => format!("{}:{p}", base.host),
         None => base.host.clone(),
@@ -405,6 +472,7 @@ pub(crate) fn http_get_json(
 fn connect(
     base: &Base,
     ca_path: Option<&Path>,
+    read_timeout: Duration,
 ) -> Result<Box<dyn ReadWrite>, String> {
     let port = base.effective_port();
     let addrs: Vec<std::net::SocketAddr> = (base.host.as_str(), port)
@@ -428,7 +496,7 @@ fn connect(
         }
     }
     let tcp = tcp.ok_or(tcp_err)?;
-    let _ = tcp.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = tcp.set_read_timeout(Some(read_timeout));
     let _ = tcp.set_write_timeout(Some(IO_TIMEOUT));
     if !base.https {
         return Ok(Box::new(tcp));
@@ -838,11 +906,468 @@ mod tests {
 /// Tests for the OpenBao backend (canned JSON, no network).
 #[cfg(test)]
 mod openbao_tests {
-    // TODO(openbao): backend tests.
+    use super::http_tests::{ca_path, tls_fixture};
+    use super::*;
+
+    const TOKEN: &str = "hvs.TOPSECRETTOKEN";
+
+    /// A KV v2 read response for path `secret/ai/one` with field
+    /// `api_key` (value carries a trailing newline for check_value).
+    fn kv2_body(value: &str) -> String {
+        format!(
+            r#"{{"request_id":"r","lease_id":"","renewable":false,"lease_duration":0,"data":{{"data":{{"api_key":"{value}"}},"metadata":{{"version":1,"created_time":"2026-01-01T00:00:00Z"}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn kv2_response_extracts_string_field() {
+        let body = serde_json::from_str::<serde_json::Value>(
+            r#"{"data":{"data":{"api_key":"s3cr3t\n"}}}"#,
+        )
+        .unwrap();
+        let value = parse_kv2_response(
+            &body,
+            "ENV_KEY",
+            "secret/ai/app#api_key",
+            "api_key",
+        )
+        .unwrap();
+        // One trailing newline stripped, value intact.
+        assert_eq!(value, "s3cr3t");
+    }
+
+    #[test]
+    fn kv2_response_missing_field_names_key_and_ref() {
+        let body = serde_json::from_str::<serde_json::Value>(
+            r#"{"data":{"data":{"other":"topsecretvalue123"}}}"#,
+        )
+        .unwrap();
+        let err = parse_kv2_response(
+            &body,
+            "ENV_KEY",
+            "secret/ai/app#api_key",
+            "api_key",
+        )
+        .unwrap_err();
+        assert!(err.contains("ENV_KEY"), "{err}");
+        assert!(err.contains("secret/ai/app#api_key"), "{err}");
+        assert!(err.contains("field not found"), "{err}");
+        // The present field's value must not leak through the error.
+        assert!(!err.contains("topsecretvalue123"), "{err}");
+    }
+
+    #[test]
+    fn kv2_response_rejects_non_string_field() {
+        for (json, kind) in [
+            (r#"{"data":{"data":{"f":424242}}}"#, "number"),
+            (r#"{"data":{"data":{"f":true}}}"#, "bool"),
+            (
+                r#"{"data":{"data":{"f":{"inner":"objsecret77"}}}}"#,
+                "object",
+            ),
+            (r#"{"data":{"data":{"f":["arrsecret88"]}}}"#, "array"),
+            (r#"{"data":{"data":{"f":null}}}"#, "null"),
+        ] {
+            let body = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            let err = parse_kv2_response(&body, "K", "m/p#f", "f").unwrap_err();
+            assert!(err.contains(kind), "{json}: {err}");
+            assert!(err.contains("not a string"), "{json}: {err}");
+            assert!(err.contains("K") && err.contains("m/p#f"), "{err}");
+            // The JSON value itself must not be echoed into the error.
+            assert!(!err.contains("424242"), "{err}");
+            assert!(!err.contains("true"), "{err}");
+            assert!(!err.contains("objsecret77"), "{err}");
+            assert!(!err.contains("arrsecret88"), "{err}");
+        }
+    }
+
+    #[test]
+    fn kv2_response_missing_data_layers() {
+        for json in [
+            "{}",
+            r#"{"errors":[]}"#,
+            r#"{"data":"notanobject"}"#,
+            r#"{"data":{}}"#,
+            r#"{"data":{"data":null}}"#,
+        ] {
+            let body = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            let err = parse_kv2_response(&body, "K", "m/p#f", "f").unwrap_err();
+            assert!(
+                err.contains("K") && err.contains("m/p#f"),
+                "{json}: {err}"
+            );
+            assert!(
+                err.contains("no data object")
+                    || err.contains("no data.data object"),
+                "{json}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn openbao_errors_never_contain_token() {
+        // Bind and drop a loopback port: guaranteed closed, so the
+        // request fails at connect and the error path carries a dummy
+        // token that must not appear in the message.
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let base = parse_url(&format!("http://127.0.0.1:{port}")).unwrap();
+        let err = fetch_openbao(
+            &base,
+            None,
+            TOKEN,
+            &[("ENV_KEY".into(), "secret/ai/app#api_key".into())],
+        )
+        .unwrap_err();
+        assert!(err.contains("ENV_KEY"), "{err}");
+        assert!(err.contains("secret/ai/app#api_key"), "{err}");
+        assert!(!err.contains(TOKEN), "{err}");
+    }
+
+    #[test]
+    fn openbao_fetch_returns_pairs_in_order() {
+        let fx = tls_fixture(vec![
+            Some(super::http_tests::cl_response(&kv2_body("value-one\\n"))),
+            Some(super::http_tests::cl_response(&kv2_body("value-two"))),
+        ]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        let out = fetch_openbao(
+            &base,
+            Some(&ca_path()),
+            TOKEN,
+            &[
+                ("K1".into(), "secret/ai/one#api_key".into()),
+                ("K2".into(), "secret/my app/creds#api_key".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], ("K1".to_string(), "value-one".to_string()));
+        assert_eq!(out[1], ("K2".to_string(), "value-two".to_string()));
+        // Each key is one GET on the KV v2 read endpoint, mount first,
+        // every path segment percent-encoded, token in the header.
+        let reqs = fx.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "{reqs:?}");
+        assert!(
+            reqs[0].starts_with("GET /v1/secret/data/ai/one HTTP/1.1\r\n"),
+            "{}",
+            reqs[0]
+        );
+        assert!(
+            reqs[1]
+                .starts_with("GET /v1/secret/data/my%20app/creds HTTP/1.1\r\n"),
+            "{}",
+            reqs[1]
+        );
+        for req in reqs.iter() {
+            assert!(
+                req.contains(&format!("X-Vault-Token: {TOKEN}\r\n")),
+                "{req}"
+            );
+        }
+    }
+
+    #[test]
+    fn openbao_fetch_aborts_batch_on_http_error() {
+        let body = "permission denied: token lacks capability";
+        let fx = tls_fixture(vec![
+            Some(super::http_tests::cl_response(&kv2_body("value-one"))),
+            Some(super::http_tests::status_response(403, "Forbidden", body)),
+        ]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        let err = fetch_openbao(
+            &base,
+            Some(&ca_path()),
+            TOKEN,
+            &[
+                ("K1".into(), "secret/ai/one#api_key".into()),
+                ("K2".into(), "secret/ai/two#api_key".into()),
+            ],
+        )
+        .unwrap_err();
+        // The failure names the key that failed, the ref and the HTTP
+        // status — not the token, the response body or the value that
+        // was fetched successfully before the failure.
+        assert!(err.contains("K2"), "{err}");
+        assert!(err.contains("secret/ai/two#api_key"), "{err}");
+        assert!(err.contains("403"), "{err}");
+        assert!(!err.contains(TOKEN), "{err}");
+        assert!(!err.contains("permission denied"), "{err}");
+        assert!(!err.contains("value-one"), "{err}");
+    }
 }
 
 /// Tests for the 1Password Connect backend (canned JSON, no network).
 #[cfg(test)]
 mod onepassword_tests {
     // TODO(onepassword): backend tests.
+}
+
+/// Tests for the shared minimal HTTP client, over a local TLS fixture
+/// serving canned responses from the repo's test-only certificate.
+#[cfg(test)]
+mod http_tests {
+    use super::{http_get_json, http_get_json_with, parse_url};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    /// A running TLS fixture: its port plus every request head received,
+    /// in connection order.
+    pub(crate) struct Fixture {
+        pub port: u16,
+        pub requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Serve each popped entry on its own TLS connection: `Some(head +
+    /// body)` is written verbatim after the request head arrives;
+    /// `Some` holding `None` accepts and then stalls without replying.
+    /// An exhausted queue closes the connection. Each call gets a fresh
+    /// listener on 127.0.0.1:0.
+    pub(crate) fn tls_fixture(responses: Vec<Option<String>>) -> Fixture {
+        use rustls::pki_types::pem::PemObject;
+        use std::collections::VecDeque;
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        let cert = rustls::pki_types::CertificateDer::from_pem_slice(
+            &std::fs::read(format!("{dir}/test-only-cert.pem")).unwrap(),
+        )
+        .unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(
+            &std::fs::read(format!("{dir}/test-only-key.pem")).unwrap(),
+        )
+        .unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let config = Arc::new(config);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let queue: Arc<Mutex<VecDeque<Option<String>>>> =
+            Arc::new(Mutex::new(responses.into_iter().collect()));
+        let requests: Arc<Mutex<Vec<String>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
+        thread::spawn(move || {
+            for conn in listener.incoming().map_while(Result::ok) {
+                let canned = queue.lock().unwrap().pop_front();
+                let config = Arc::clone(&config);
+                let requests = Arc::clone(&server_requests);
+                thread::spawn(move || {
+                    let Ok(server_conn) = rustls::ServerConnection::new(config)
+                    else {
+                        return;
+                    };
+                    let mut tls = rustls::StreamOwned::new(server_conn, conn);
+                    let mut buf = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        match tls.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf).into_owned());
+                    match canned {
+                        Some(None) => {
+                            // Stall far past any client read timeout.
+                            thread::sleep(Duration::from_secs(2));
+                        }
+                        Some(Some(resp)) => {
+                            let _ = tls.write_all(resp.as_bytes());
+                            let _ = tls.flush();
+                        }
+                        None => {}
+                    }
+                });
+            }
+        });
+        Fixture { port, requests }
+    }
+
+    /// The fixture's self-signed CA, so the client trusts it.
+    pub(crate) fn ca_path() -> std::path::PathBuf {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-only-cert.pem"
+        )
+        .into()
+    }
+
+    /// 200 with a Content-Length body.
+    pub(crate) fn cl_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// 200 with the body sent in one chunk plus the zero terminator.
+    pub(crate) fn chunked_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+            body.len()
+        )
+    }
+
+    /// 200 whose Content-Length exceeds the 1 MiB body cap; no body is
+    /// sent, so a client that tried to read it would hang or fail
+    /// differently than the cap check.
+    pub(crate) fn oversized_response() -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            2 * 1024 * 1024
+        )
+    }
+
+    /// A non-2xx with a body the error must not echo.
+    pub(crate) fn status_response(
+        status: u16,
+        reason: &str,
+        body: &str,
+    ) -> String {
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn http_get_json_parses_content_length_body() {
+        let token = "hvs.cl-token";
+        let fx = tls_fixture(vec![Some(cl_response(
+            r#"{"data":{"data":{"k":"v"}}}"#,
+        ))]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        let out = http_get_json(
+            &base,
+            Some(&ca_path()),
+            &[("X-Vault-Token", token)],
+            "/v1/secret/data/k",
+        )
+        .unwrap();
+        assert_eq!(out["data"]["data"]["k"], "v");
+        // Request shape sanity: path and token header hit the wire.
+        let reqs = fx.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert!(
+            reqs[0].starts_with("GET /v1/secret/data/k HTTP/1.1\r\n"),
+            "{}",
+            reqs[0]
+        );
+        assert!(
+            reqs[0].contains(&format!("X-Vault-Token: {token}\r\n")),
+            "{}",
+            reqs[0]
+        );
+    }
+
+    #[test]
+    fn http_get_json_parses_chunked_body() {
+        let fx = tls_fixture(vec![Some(chunked_response(
+            r#"{"chunked":true,"n":3}"#,
+        ))]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        let out = http_get_json(
+            &base,
+            Some(&ca_path()),
+            &[("X-Vault-Token", "hvs.t")],
+            "/v1/secret/data/k",
+        )
+        .unwrap();
+        assert_eq!(out["chunked"], true);
+        assert_eq!(out["n"], 3);
+    }
+
+    #[test]
+    fn http_get_json_rejects_oversized_content_length() {
+        let token = "hvs.big-token";
+        let fx = tls_fixture(vec![Some(oversized_response())]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        let err = http_get_json(
+            &base,
+            Some(&ca_path()),
+            &[("X-Vault-Token", token)],
+            "/v1/secret/data/k",
+        )
+        .unwrap_err();
+        // Rejected by the cap before any body read.
+        assert!(err.contains("too large"), "{err}");
+        assert!(!err.contains(token), "{err}");
+    }
+
+    #[test]
+    fn http_get_json_non_2xx_hides_token_and_body() {
+        let token = "hvs.TOPSECRETTOKEN";
+        let body = "permission denied: token lacks capability";
+        let fx =
+            tls_fixture(vec![Some(status_response(403, "Forbidden", body))]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        let err = http_get_json(
+            &base,
+            Some(&ca_path()),
+            &[("X-Vault-Token", token)],
+            "/v1/secret/data/k",
+        )
+        .unwrap_err();
+        assert!(err.contains("403"), "{err}");
+        assert!(!err.contains(token), "{err}");
+        assert!(!err.contains("permission denied"), "{err}");
+    }
+
+    #[test]
+    fn http_get_json_rejects_untrusted_server_cert() {
+        let fx = tls_fixture(vec![Some(cl_response("{}"))]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        // No CA override: webpki roots only, and the self-signed test
+        // certificate is not among them.
+        assert!(
+            http_get_json(
+                &base,
+                None,
+                &[("X-Vault-Token", "hvs.t")],
+                "/v1/secret/data/k"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn http_get_json_times_out_when_server_stalls() {
+        let token = "hvs.stalled-token";
+        let fx = tls_fixture(vec![None]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        let err = http_get_json_with(
+            &base,
+            Some(&ca_path()),
+            &[("X-Vault-Token", token)],
+            "/v1/secret/data/k",
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(!err.contains(token), "{err}");
+    }
 }
