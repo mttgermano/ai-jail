@@ -700,31 +700,76 @@ serialized back to disk.
 
 #### SSH certificates from OpenBao: `--ssh-cert-role`
 
-With an OpenBao SSH secrets engine, each launch can get a short-lived
-certificate instead of a long-lived key. ai-jail generates a fresh key in
-a private host directory, has OpenBao sign it (`POST
-/v1/<mount>/sign/<role>`, same URL, CA and `AI_JAIL_SECRET_TOKEN` as
-above), and loads it into the selected-key SSH agent with the same
-lifetime and destination limits. The key file is deleted once the agent
-holds it; the jail only sees the agent socket.
+With an OpenBao SSH secrets engine, each launch gets a short-lived
+certificate instead of a long-lived key:
+
+1. ai-jail generates a fresh key in a private host directory.
+2. It sends the public half to OpenBao (`POST /v1/<mount>/sign/<role>`,
+   same URL, CA and `AI_JAIL_SECRET_TOKEN` as above) and gets back a
+   certificate.
+3. It loads key and certificate into the selected-key SSH agent, bounded
+   by `ssh_cert_ttl` and the `ssh_cert_hosts` destinations, and deletes
+   the key file. The jail only sees the agent socket.
 
 ```toml
 # ~/.config/ai-jail/config.toml
 secrets_provider_type = "openbao"
 secrets_provider_url = "https://bao.example.com"
 ssh_cert_role = "ssh/ai-agent"             # mount/role
-ssh_cert_hosts = ["git@git.example.com"]   # [user@]host, needs known_hosts
-ssh_cert_ttl = 3600                        # seconds, 60-86400
+ssh_cert_hosts = ["git@git.example.com", "admin@server.example.com"]
+ssh_cert_ttl = 3600                        # seconds, 60-86400 (default 3600)
 ```
 
-The OpenBao token needs `update` on `ssh/sign/ai-agent`. Like
-selected-key SSH, this needs unrestricted network (`--network`); without
-it the role is skipped quietly (`--verbose` says why). A project's own
-selected keys win over the global role, and the role is not applied on
-a project's first-run setup launch. Inside the jail, git uses the agent
-automatically; direct ssh is `"$AI_JAIL_SSH" -F "$AI_JAIL_SSH_CONFIG"
-host`. The certificate is signed once per launch, so a session longer
-than the lifetime loses SSH until the next launch.
+`ssh_cert_role` names the OpenBao role that signs, as `mount/role`
+(`ssh/ai-agent` is role `ai-agent` on the `ssh` mount). The role decides
+which login names (principals) a certificate carries and its maximum
+lifetime. Two independent limits apply:
+
+- **Principals** (in the certificate, checked by the server): who you may
+  log in as.
+- **`ssh_cert_hosts`** (in the agent, checked on the host): where the
+  key may be used at all. Each entry needs a verified host key in
+  `~/.ssh/known_hosts` under its plain host name.
+
+One-time OpenBao setup:
+
+```sh
+bao secrets enable ssh
+bao write ssh/config/ca generate_signing_key=true key_type=ssh-ed25519
+bao write ssh/roles/ai-agent key_type=ca allow_user_certificates=true \
+  allowed_users="admin,alice" default_user="admin,alice" \
+  ttl=1h max_ttl=24h \
+  allowed_extensions=permit-pty default_extensions='{"permit-pty":""}'
+bao policy write ai-jail-ssh - <<<'path "ssh/sign/ai-agent" { capabilities = ["update"] }'
+bao token create -orphan -policy=ai-jail-ssh -no-default-policy -ttl=768h
+```
+
+`default_user` may list several principals, so one certificate serves
+every server. Writing a role replaces it, so always send every field.
+
+Each server then trusts the CA once, never individual certificates. Get
+the CA key with `curl https://bao.example.com/v1/ssh/public_key`, then:
+
+- **OpenSSH**: add `TrustedUserCAKeys /path/to/ca.pub` to `sshd_config`
+  (on appliances that manage sshd, such as TrueNAS, use their extra SSH
+  options setting so it is not overwritten). The login user must be one
+  of the certificate's principals.
+- **Forgejo/Gitea built-in SSH**: set `SSH_TRUSTED_USER_CA_KEYS = <ca
+key>` in `[server]` of `app.ini`, restart, and add the principal under
+  Settings → SSH / GPG Keys → Manage SSH Principals. The certificate then
+  acts as that account.
+
+Inside the jail, git uses the agent automatically; direct ssh is
+`"$AI_JAIL_SSH" -F "$AI_JAIL_SSH_CONFIG" host`. The jail does not see
+your `~/.ssh/config`, so pass non-standard ports explicitly (`-p 2222`,
+or `ssh://git@host:2222/owner/repo.git` for git remotes).
+
+Like selected-key SSH, this needs unrestricted network (`--network`);
+without it the role is skipped quietly (`--verbose` says why). A
+project's own selected keys win over the global role. The certificate is
+signed once per launch, so a session longer than the lifetime loses SSH
+until the next launch. Because the agent holds only the signed key, the
+generated ssh config uses `IdentitiesOnly no` in this mode.
 
 ## Audit log
 
