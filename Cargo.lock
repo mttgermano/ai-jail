@@ -18,6 +18,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "toml",
+ "toml_edit",
  "vt100",
  "webpki-roots 0.26.11",
  "zeroize",

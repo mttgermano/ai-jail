@@ -625,6 +625,78 @@ File and directory permissions are never changed.
 Auto-save strips them, but don't rely on it: write secrets into files or
 your shell, never into config.
 
+### Vault-backed secrets: `--secret-provider`
+
+`--secret-provider` resolves bare `--env NAME` entries from a self-hosted
+vault (1Password Connect or OpenBao) instead of the local shell
+environment. The fetch happens on the host, before the sandbox starts,
+and splices the values in as explicit `NAME=VALUE` entries, so `--secret`
+phantomization and `--env` ordering keep working unchanged.
+
+Resolution per requested key:
+
+| Situation | Result |
+| --- | --- |
+| `--secret-provider` off (default) | bare `NAME` copies the local host value (unchanged behavior) |
+| flag on, provider type or URL missing | launch fails (set both via CLI flags or global config) |
+| `NAME` not in `secret_refs` | copies the local host value |
+| `NAME` in `secret_refs` | fetched from the provider; any failure stops the launch — no local fallback |
+
+Configure the backend in trusted config (global `$HOME/.ai-jail`, or a
+project listed in `trust_project_config`):
+
+```toml
+# ~/.ai-jail
+secrets_provider_type = "onepassword"     # or "openbao" (aliases: op, bao)
+secrets_provider_url = "https://op.internal:8080"  # server root, https required
+secrets_provider_ca = "~/op-ca.pem"       # optional extra PEM CA (private CAs)
+
+[secret_refs]
+# One launch uses one backend; every ref must match its shape.
+ANTHROPIC_API_KEY = "Dev/Anthropic/credential"  # 1Password: Vault/Item/field
+OPENAI_API_KEY = "secret/ai/openai#api_key"     # OpenBao: mount/path#field
+```
+
+Then launch with `ai-jail --secret-provider --env ANTHROPIC_API_KEY --env
+OPENAI_API_KEY claude`. `secret_refs` is an allowlist: a bare `--env
+NAME` whose name is absent from it still copies the local value.
+`--secret-ref KEY=REF` (repeatable, trusted config/CLI only) overrides a
+`secret_refs` config entry for one launch.
+
+Both backends speak HTTPS (the token travels in a request header); plain
+`http://` is accepted only for loopback hosts (`127.0.0.1`, `::1`,
+`localhost`) so a local dev server works. 1Password refs are
+`Vault/Item/field`, each segment a name or a 26-character ID, served by a
+1Password Connect server (`Authorization: Bearer`). OpenBao refs are
+`mount/path#field` against a KV v2 mount (`X-Vault-Token` header).
+
+Use a least-privilege token: a Connect token scoped to the one vault the
+refs need, or for OpenBao a policy like
+
+```hcl
+path "secret/data/ai/*" {
+  capabilities = ["read"]
+}
+```
+
+The token travels in the `AI_JAIL_SECRET_TOKEN` environment variable:
+
+```sh
+export AI_JAIL_SECRET_TOKEN=<provider token>
+ai-jail --secret-provider --env ANTHROPIC_API_KEY claude
+```
+
+Token hygiene: ai-jail reads the variable and removes it from its own
+environment immediately, before the sandbox is assembled — the token
+never enters the jail, cannot be copied by `--inherit-env`, and never
+appears on argv, in errors, or in `ai-jail status` output (which shows
+only the provider type, the URL host, and the ref key names). The name is
+also refused as an `--env`/`env_pass` entry, flag or no flag, so it
+cannot be smuggled into the sandbox by hand. `secret_refs` and the
+provider settings live in trusted config only: an untrusted project
+`.ai-jail` has them ignored with a warning, and they are never
+serialized back to disk.
+
 ## Audit log
 
 Use `--audit-log` to record launches and filtered network decisions locally in

@@ -1447,6 +1447,10 @@ enum StaticRenderer {
     EnvPass,
     EnvFiles,
     SecretHosts,
+    SecretRefs,
+    SecretProviderType,
+    SecretProviderUrl,
+    SecretProviderCa,
     TrustedProjects,
 }
 
@@ -1575,6 +1579,10 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     static_policy!("env_pass", SensitiveAuthority, EnvPass),
     static_policy!("env_from_file", SensitiveAuthority, EnvFiles),
     static_policy!("secret_hosts", SensitiveAuthority, SecretHosts),
+    static_policy!("secret_refs", SensitiveAuthority, SecretRefs),
+    static_policy!("secrets_provider_type", Authority, SecretProviderType),
+    static_policy!("secrets_provider_url", Authority, SecretProviderUrl),
+    static_policy!("secrets_provider_ca", Authority, SecretProviderCa),
     static_policy!("trust_project_config", Authority, TrustedProjects),
     directional_policy!("update_check", UpdateCheck, "update-check-network"),
     directional_policy!("audit_log", AuditLog, "audit-log-host-write"),
@@ -1822,6 +1830,30 @@ fn render_static_authority(
             .map(|(name, host)| {
                 format!("secret-variable {name} for host {host}")
             })
+            .collect(),
+        StaticRenderer::SecretRefs => config
+            .secret_refs
+            .keys()
+            .filter(|name| !baseline.secret_refs.contains_key(*name))
+            .map(|name| format!("secret-ref {name}"))
+            .collect(),
+        StaticRenderer::SecretProviderType => config
+            .secrets_provider_type
+            .iter()
+            .filter(|v| baseline.secrets_provider_type.as_ref() != Some(*v))
+            .map(|v| format!("secret-provider-type {v}"))
+            .collect(),
+        StaticRenderer::SecretProviderUrl => config
+            .secrets_provider_url
+            .iter()
+            .filter(|v| baseline.secrets_provider_url.as_ref() != Some(*v))
+            .map(|v| format!("secret-provider-url {v}"))
+            .collect(),
+        StaticRenderer::SecretProviderCa => config
+            .secrets_provider_ca
+            .iter()
+            .filter(|p| baseline.secrets_provider_ca.as_ref() != Some(*p))
+            .map(|p| format!("secret-provider-ca {}", p.display()))
             .collect(),
         StaticRenderer::TrustedProjects => added_paths(
             &config.trust_project_config,
@@ -2364,6 +2396,30 @@ mod tests {
             ["secret-variable API_TOKEN for host api.example.com"]
         ),
         expected_authority!(
+            "secret_refs",
+            SensitiveAuthority,
+            SecretRefs,
+            ["secret-ref API_TOKEN"]
+        ),
+        expected_authority!(
+            "secrets_provider_type",
+            Authority,
+            SecretProviderType,
+            ["secret-provider-type openbao"]
+        ),
+        expected_authority!(
+            "secrets_provider_url",
+            Authority,
+            SecretProviderUrl,
+            ["secret-provider-url https://bao.example.com"]
+        ),
+        expected_authority!(
+            "secrets_provider_ca",
+            Authority,
+            SecretProviderCa,
+            ["secret-provider-ca /outside/ca.pem"]
+        ),
+        expected_authority!(
             "trust_project_config",
             Authority,
             TrustedProjects,
@@ -2424,6 +2480,21 @@ mod tests {
                 config
                     .secret_hosts
                     .insert("API_TOKEN".into(), "api.example.com".into());
+            }
+            "secret_refs" => {
+                config
+                    .secret_refs
+                    .insert("API_TOKEN".into(), "kv/app#token".into());
+            }
+            "secrets_provider_type" => {
+                config.secrets_provider_type = Some("openbao".into());
+            }
+            "secrets_provider_url" => {
+                config.secrets_provider_url =
+                    Some("https://bao.example.com".into());
+            }
+            "secrets_provider_ca" => {
+                config.secrets_provider_ca = Some("/outside/ca.pem".into());
             }
             "trust_project_config" => {
                 config.trust_project_config = vec!["/outside/trusted".into()];
