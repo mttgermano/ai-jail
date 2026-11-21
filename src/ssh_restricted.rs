@@ -751,7 +751,8 @@ impl Plan {
         let config_root = self.public_dir.to_string_lossy().into_owned();
         write_private(
             &self.public_dir.join("config"),
-            render_config(&identity_agent, &config_root).as_bytes(),
+            render_config(&identity_agent, &config_root, self.cert.is_some())
+                .as_bytes(),
         )?;
         crate::signals::abort_if_cancelled()?;
         let child = Command::new(&self.tools.agent.path)
@@ -954,9 +955,17 @@ impl Plan {
     }
 }
 
-fn render_config(identity_agent: &str, config_root: &str) -> String {
+fn render_config(
+    identity_agent: &str,
+    config_root: &str,
+    cert: bool,
+) -> String {
+    // With IdentitiesOnly and no IdentityFile, ssh never offers the
+    // agent's signed key. The agent holds only that one key, so
+    // IdentitiesOnly would restrict nothing in certificate mode.
+    let identities_only = if cert { "no" } else { "yes" };
     format!(
-        "Host *\n  IdentityAgent {identity_agent}\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile {config_root}/known_hosts\n  GlobalKnownHostsFile {config_root}/global_known_hosts\n"
+        "Host *\n  IdentityAgent {identity_agent}\n  IdentitiesOnly {identities_only}\n  StrictHostKeyChecking yes\n  UserKnownHostsFile {config_root}/known_hosts\n  GlobalKnownHostsFile {config_root}/global_known_hosts\n"
     )
 }
 
@@ -1468,7 +1477,10 @@ mod tests {
 
     #[test]
     fn generated_config_always_uses_strict_host_key_files() {
-        let rendered = render_config(JAIL_AGENT_SOCKET, JAIL_PUBLIC_DIR);
+        let rendered = render_config(JAIL_AGENT_SOCKET, JAIL_PUBLIC_DIR, false);
+        let with_cert = render_config(JAIL_AGENT_SOCKET, JAIL_PUBLIC_DIR, true);
+        assert!(with_cert.contains("IdentitiesOnly no"));
+        assert!(with_cert.contains("StrictHostKeyChecking yes"));
         assert!(rendered.contains("StrictHostKeyChecking yes"));
         assert!(rendered.contains(
             "UserKnownHostsFile /tmp/ai-jail-ssh-public/known_hosts"
