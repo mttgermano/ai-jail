@@ -407,7 +407,10 @@ variables:
 ```
 
 Only that generated file appears in the jail's `~/.ssh`; the host `~/.ssh`
-stays hidden. Destination limits are enforced by the agent either way. The temporary agent
+stays hidden. Destination limits are enforced by the agent either way.
+Host aliases (`HostName`, `Port`, `User`) can be added in the owner-only
+`~/.config/ai-jail/ssh-config`; ai-jail appends them after its own block, so
+they cannot loosen the agent or host-key settings. The temporary agent
 is killed and its generated public files are removed on normal exit, launch
 failure, and handled termination. `SIGKILL` cannot guarantee immediate
 cleanup; the configured `ssh-add` lifetime bounds use of keys left in a

@@ -116,6 +116,9 @@ pub(crate) struct Plan {
     /// Set in certificate mode: the agent gets one fresh signed key instead
     /// of `policy.keys`.
     cert: Option<CertSigner>,
+    /// The user's `~/.config/ai-jail/ssh-config` (host aliases, ports),
+    /// appended after the generated block.
+    user_config: String,
 }
 
 #[derive(Clone, Debug)]
@@ -525,7 +528,31 @@ fn plan_validated(
     home: &Path,
 ) -> Result<Plan, String> {
     let tools = Toolset::resolve()?;
-    plan_validated_with_tools(policy, config, home, tools)
+    let mut plan = plan_validated_with_tools(policy, config, home, tools)?;
+    plan.user_config = read_user_config()?;
+    Ok(plan)
+}
+
+/// Host blocks from the trusted `~/.config/ai-jail/ssh-config` (owner-only
+/// 0600, like the rest of the store). They come after the generated
+/// `Host *` block, and ssh keeps the first value it reads for each option,
+/// so they can add aliases, ports and users but cannot replace the agent,
+/// host-key checking or known_hosts file.
+fn read_user_config() -> Result<String, String> {
+    const MAX_BYTES: usize = 64 * 1024;
+    let Some(path) = crate::config_store::trusted_store_root()
+        .map(|root| root.join("ssh-config"))
+    else {
+        return Ok(String::new());
+    };
+    let Some(bytes) = crate::config_store::read_trusted_regular(&path)? else {
+        return Ok(String::new());
+    };
+    if bytes.len() > MAX_BYTES || bytes.contains(&0) {
+        return Err(format!("{} must be text under 64 KiB", path.display()));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| format!("{} is not UTF-8", path.display()))
 }
 
 fn plan_validated_with_tools(
@@ -617,6 +644,7 @@ fn plan_validated_with_tools(
         known_hosts,
         tools,
         cert: None,
+        user_config: String::new(),
     })
 }
 
@@ -762,8 +790,15 @@ impl Plan {
         let config_root = self.public_dir.to_string_lossy().into_owned();
         write_private(
             &self.public_dir.join("config"),
-            render_config(&identity_agent, &config_root, self.cert.is_some())
-                .as_bytes(),
+            with_user_config(
+                render_config(
+                    &identity_agent,
+                    &config_root,
+                    self.cert.is_some(),
+                ),
+                &self.user_config,
+            )
+            .as_bytes(),
         )?;
         crate::signals::abort_if_cancelled()?;
         let child = Command::new(&self.tools.agent.path)
@@ -978,6 +1013,14 @@ fn render_config(
     format!(
         "Host *\n  IdentityAgent {identity_agent}\n  IdentitiesOnly {identities_only}\n  StrictHostKeyChecking yes\n  UserKnownHostsFile {config_root}/known_hosts\n  GlobalKnownHostsFile {config_root}/global_known_hosts\n"
     )
+}
+
+/// The generated block first: ssh keeps the first value per option.
+fn with_user_config(generated: String, user: &str) -> String {
+    if user.trim().is_empty() {
+        return generated;
+    }
+    format!("{generated}\n# ~/.config/ai-jail/ssh-config\n{user}\n")
 }
 
 /// Run a trusted SSH tool, retrying a transient `ETXTBSY`.
@@ -1229,6 +1272,19 @@ mod tests {
         assert!(!args.contains("-c"));
         assert!(!args.contains("SSH_AUTH_SOCK"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_ssh_config_follows_the_generated_block() {
+        let generated = render_config(JAIL_AGENT_SOCKET, JAIL_PUBLIC_DIR, true);
+        assert_eq!(with_user_config(generated.clone(), "  \n"), generated);
+        let user = "Host bloob\n  HostName 10.0.0.100\n  Port 2002\n  StrictHostKeyChecking no\n";
+        let full = with_user_config(generated.clone(), user);
+        assert!(full.starts_with(&generated));
+        let strict = full.find("StrictHostKeyChecking yes").unwrap();
+        let loose = full.find("StrictHostKeyChecking no").unwrap();
+        assert!(strict < loose, "generated value must be read first");
+        assert!(full.contains("Host bloob"));
     }
 
     #[test]

@@ -686,7 +686,9 @@ fn read_legacy_regular(path: &Path) -> Result<Option<LegacyFile>, String> {
     }))
 }
 
-fn read_trusted_regular(path: &Path) -> Result<Option<Vec<u8>>, String> {
+pub(crate) fn read_trusted_regular(
+    path: &Path,
+) -> Result<Option<Vec<u8>>, String> {
     let Some(source) = read_legacy_regular(path)? else {
         return Ok(None);
     };

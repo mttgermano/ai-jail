@@ -776,6 +776,23 @@ the jail's `~/.ssh/config` (on macOS use `"$AI_JAIL_SSH" -F
 `~/.ssh/config`, so pass non-standard ports explicitly (`-p 2222`,
 or `ssh://git@host:2222/owner/repo.git` for git remotes).
 
+To use host aliases instead, put `Host` blocks in
+`~/.config/ai-jail/ssh-config` (owner-only, mode `0600`, like the rest of
+the store). ai-jail appends them after its generated block, so they can
+set `HostName`, `Port` and `User` but cannot replace the agent,
+`StrictHostKeyChecking` or the known_hosts file (ssh keeps the first value
+it reads). Destinations still have to be in the project's list.
+
+```sshconfig
+# ~/.config/ai-jail/ssh-config
+Host bloob
+  HostName 10.0.0.100
+  Port 2002
+  User admin
+```
+
+Then `ssh bloob` works in the jail, while your own `~/.ssh` stays hidden.
+
 Like selected-key SSH, this needs unrestricted network (`--network`). The
 certificate is
 signed once per launch, so a session longer than the lifetime loses SSH
