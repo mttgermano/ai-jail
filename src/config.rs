@@ -406,6 +406,21 @@ pub struct Config {
     /// secrets.
     #[serde(default, skip_serializing)]
     pub secret_refs: std::collections::BTreeMap<String, String>,
+    /// OpenBao SSH signing role (`--ssh-cert-role`), `mount/role`. When
+    /// set, each launch signs a fresh key with the secret-provider URL and
+    /// token and loads it into the selected-key SSH agent. Trusted layers
+    /// only. Never serialized.
+    #[serde(default, skip_serializing)]
+    pub ssh_cert_role: Option<String>,
+    /// Destinations the signed key may reach (`--ssh-cert-host`,
+    /// `[user@]host`, repeatable); each needs a host key in known_hosts.
+    /// Trusted layers only. Never serialized.
+    #[serde(default, skip_serializing)]
+    pub ssh_cert_hosts: Vec<String>,
+    /// Certificate and agent lifetime in seconds (`--ssh-cert-ttl`,
+    /// 60-86400, default 3600). Trusted layers only. Never serialized.
+    #[serde(default, skip_serializing)]
+    pub ssh_cert_ttl: Option<u32>,
     /// Directories whose project `.ai-jail` is trusted to grant
     /// capabilities, instead of being treated as untrusted monotonic
     /// policy. A project matches when it is one of these directories or
@@ -1389,6 +1404,10 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(secrets_provider_url);
     take!(secrets_provider_ca);
     c.secret_refs.extend(local.secret_refs);
+    take!(ssh_cert_role);
+    take!(ssh_cert_ttl);
+    c.ssh_cert_hosts.extend(local.ssh_cert_hosts);
+    c.ssh_cert_hosts.dedup();
     c.allow_tcp_ports.extend(local.allow_tcp_ports);
     c.allow_tcp_ports.sort_unstable();
     c.allow_tcp_ports.dedup();
@@ -1801,6 +1820,15 @@ pub fn merge_with_global_report(
     if !local.secret_refs.is_empty() {
         warnings.push(
             "project .ai-jail secret_refs ignored (use --secret-ref or global config)"
+                .into(),
+        );
+    }
+    if local.ssh_cert_role.is_some()
+        || local.ssh_cert_ttl.is_some()
+        || !local.ssh_cert_hosts.is_empty()
+    {
+        warnings.push(
+            "project .ai-jail ssh_cert_* ignored (use --ssh-cert-role or global config)"
                 .into(),
         );
     }
@@ -2464,6 +2492,15 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     }
     for (key, r) in &cli.secret_refs {
         config.secret_refs.insert(key.clone(), r.clone());
+    }
+    if let Some(ref v) = cli.ssh_cert_role {
+        config.ssh_cert_role = Some(v.clone());
+    }
+    if let Some(v) = cli.ssh_cert_ttl {
+        config.ssh_cert_ttl = Some(v);
+    }
+    if !cli.ssh_cert_hosts.is_empty() {
+        config.ssh_cert_hosts = cli.ssh_cert_hosts.clone();
     }
 
     if let Some(p) = cli.claude_dir.clone() {
@@ -4753,6 +4790,9 @@ no_gpu = true
             secrets_provider_url: None,
             secrets_provider_ca: None,
             secret_refs: Default::default(),
+            ssh_cert_role: None,
+            ssh_cert_hosts: vec![],
+            ssh_cert_ttl: None,
             trust_project_config: vec![],
             update_check: Some(false),
             audit_log: Some(true),
@@ -8447,6 +8487,9 @@ hide_dotdirs = [".my_secrets"]
             secrets_provider_url: None,
             secrets_provider_ca: None,
             secret_refs: Default::default(),
+            ssh_cert_role: None,
+            ssh_cert_hosts: vec![],
+            ssh_cert_ttl: None,
             trust_project_config: vec![],
             update_check: None,
             audit_log: None,

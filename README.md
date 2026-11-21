@@ -635,18 +635,19 @@ phantomization and `--env` ordering keep working unchanged.
 
 Resolution per requested key:
 
-| Situation | Result |
-| --- | --- |
-| `--secret-provider` off (default) | bare `NAME` copies the local host value (unchanged behavior) |
-| flag on, provider type or URL missing | launch fails (set both via CLI flags or global config) |
-| `NAME` not in `secret_refs` | copies the local host value |
-| `NAME` in `secret_refs` | fetched from the provider; any failure stops the launch — no local fallback |
+| Situation                             | Result                                                                      |
+| ------------------------------------- | --------------------------------------------------------------------------- |
+| `--secret-provider` off (default)     | bare `NAME` copies the local host value (unchanged behavior)                |
+| flag on, provider type or URL missing | launch fails (set both via CLI flags or global config)                      |
+| `NAME` not in `secret_refs`           | copies the local host value                                                 |
+| `NAME` in `secret_refs`               | fetched from the provider; any failure stops the launch — no local fallback |
 
-Configure the backend in trusted config (global `$HOME/.ai-jail`, or a
-project listed in `trust_project_config`):
+Configure the backend in trusted config (global
+`~/.config/ai-jail/config.toml`, or a project listed in
+`trust_project_config`):
 
 ```toml
-# ~/.ai-jail
+# ~/.config/ai-jail/config.toml
 secrets_provider_type = "onepassword"     # or "openbao" (aliases: op, bao)
 secrets_provider_url = "https://op.internal:8080"  # server root, https required
 secrets_provider_ca = "~/op-ca.pem"       # optional extra PEM CA (private CAs)
@@ -696,6 +697,34 @@ cannot be smuggled into the sandbox by hand. `secret_refs` and the
 provider settings live in trusted config only: an untrusted project
 `.ai-jail` has them ignored with a warning, and they are never
 serialized back to disk.
+
+#### SSH certificates from OpenBao: `--ssh-cert-role`
+
+With an OpenBao SSH secrets engine, each launch can get a short-lived
+certificate instead of a long-lived key. ai-jail generates a fresh key in
+a private host directory, has OpenBao sign it (`POST
+/v1/<mount>/sign/<role>`, same URL, CA and `AI_JAIL_SECRET_TOKEN` as
+above), and loads it into the selected-key SSH agent with the same
+lifetime and destination limits. The key file is deleted once the agent
+holds it; the jail only sees the agent socket.
+
+```toml
+# ~/.config/ai-jail/config.toml
+secrets_provider_type = "openbao"
+secrets_provider_url = "https://bao.example.com"
+ssh_cert_role = "ssh/ai-agent"             # mount/role
+ssh_cert_hosts = ["git@git.example.com"]   # [user@]host, needs known_hosts
+ssh_cert_ttl = 3600                        # seconds, 60-86400
+```
+
+The OpenBao token needs `update` on `ssh/sign/ai-agent`. Like
+selected-key SSH, this needs unrestricted network (`--network`); without
+it the role is skipped quietly (`--verbose` says why). A project's own
+selected keys win over the global role, and the role is not applied on
+a project's first-run setup launch. Inside the jail, git uses the agent
+automatically; direct ssh is `"$AI_JAIL_SSH" -F "$AI_JAIL_SSH_CONFIG"
+host`. The certificate is signed once per launch, so a session longer
+than the lifetime loses SSH until the next launch.
 
 ## Audit log
 

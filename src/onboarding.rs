@@ -469,6 +469,7 @@ pub(crate) fn prepare_profile(
         } else {
             proposed.restricted_ssh.clone()
         },
+        None,
     )?;
     let forge_preview =
         if effective.cli.clean || finalized.config.lockdown_enabled() {
@@ -1574,6 +1575,7 @@ fn run_sequential(
         } else {
             proposed.restricted_ssh.clone()
         },
+        None,
     )?;
     eprintln!(
         "{}",

@@ -64,7 +64,8 @@ or integration rather than saved sandbox authority.
 - Port bridges: `--forward-port`, `--publish-port`
 - Environment/secret sources: `--env-from-file`, `--secret`,
   `--secret-provider`, `--secret-provider-type`, `--secret-provider-url`,
-  `--secret-provider-ca`, `--secret-ref`
+  `--secret-provider-ca`, `--secret-ref`, `--ssh-cert-role`,
+  `--ssh-cert-host`, `--ssh-cert-ttl`
 - Harness-specific path override: `--claude-dir`
 - Browser command/profile mode: `--browser`, `--no-browser` (command-specific;
   known browser commands are detected automatically, and dry-run output

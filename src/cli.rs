@@ -149,6 +149,12 @@ OPTIONS:
                                     Dev/Item/field or secret/ai/key#field
                                     (repeatable; overrides secret_refs config
                                     entries; trusted config only)
+    --ssh-cert-role <MOUNT/ROLE>    Sign a fresh SSH key with this OpenBao role
+                                    at each launch (uses --secret-provider-url
+                                    and AI_JAIL_SECRET_TOKEN); needs --network
+    --ssh-cert-host <[USER@]HOST>   Destination the signed key may reach
+                                    (repeatable; needs a known_hosts entry)
+    --ssh-cert-ttl <SECONDS>        Certificate lifetime, 60-86400 (default 3600)
     --inherit-env / --no-inherit-env
                                     Inherit the full host environment (default: off —
                                     only a safe allowlist is passed)
@@ -306,6 +312,12 @@ pub struct CliArgs {
     /// Provider references (`--secret-ref KEY=REF`, repeatable): a bare
     /// `NAME` env entry resolves through this allowlist.
     pub secret_refs: Vec<(String, String)>,
+    /// OpenBao SSH signing role (`--ssh-cert-role mount/role`).
+    pub ssh_cert_role: Option<String>,
+    /// Destinations for the signed key (`--ssh-cert-host`, repeatable).
+    pub ssh_cert_hosts: Vec<String>,
+    /// Certificate lifetime in seconds (`--ssh-cert-ttl`).
+    pub ssh_cert_ttl: Option<u32>,
     pub env: Vec<String>,
     pub exec: bool,
     pub clean: bool,
@@ -719,6 +731,22 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     return Err("--secret-ref requires KEY=REF".into());
                 }
                 args.secret_refs.push((key.to_string(), r.to_string()));
+            }
+            Long("ssh-cert-role") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                args.ssh_cert_role = Some(val.to_string_lossy().into_owned());
+            }
+            Long("ssh-cert-host") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                args.ssh_cert_hosts.push(val.to_string_lossy().into_owned());
+            }
+            Long("ssh-cert-ttl") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                args.ssh_cert_ttl =
+                    Some(val.to_string_lossy().parse().map_err(|_| {
+                        "--ssh-cert-ttl requires a number of seconds"
+                            .to_string()
+                    })?);
             }
             Long(s @ ("worktree" | "no-worktree")) => {
                 args.worktree = Some(s == "worktree");
@@ -1211,6 +1239,9 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--secret-provider-type",
     "--secret-provider-url",
     "--secret-provider-ca",
+    "--ssh-cert-role",
+    "--ssh-cert-host",
+    "--ssh-cert-ttl",
     "--secret-ref",
     "--mise",
     "--no-mise",
@@ -2795,6 +2826,26 @@ mod tests {
             args.secret_provider_ca,
             Some(PathBuf::from("/etc/bao-ca.pem"))
         );
+    }
+
+    #[test]
+    fn parse_ssh_cert_flags() {
+        let args = parse_test(&[
+            "--ssh-cert-role",
+            "ssh/ai",
+            "--ssh-cert-host",
+            "git@a.example",
+            "--ssh-cert-host",
+            "b.example",
+            "--ssh-cert-ttl",
+            "600",
+            "claude",
+        ])
+        .unwrap();
+        assert_eq!(args.ssh_cert_role.as_deref(), Some("ssh/ai"));
+        assert_eq!(args.ssh_cert_hosts, vec!["git@a.example", "b.example"]);
+        assert_eq!(args.ssh_cert_ttl, Some(600));
+        assert!(parse_test(&["--ssh-cert-ttl", "10m"]).is_err());
     }
 
     #[test]

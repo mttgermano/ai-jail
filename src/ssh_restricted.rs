@@ -87,6 +87,19 @@ fn default_lifetime() -> u32 {
     DEFAULT_LIFETIME_SECONDS
 }
 
+/// Signs a launch-generated public key (OpenBao SSH CA): given the public
+/// key line and the lifetime in seconds, returns the OpenSSH certificate.
+pub(crate) type SignFn = dyn Fn(&str, u32) -> Result<String, String>;
+
+#[derive(Clone)]
+pub(crate) struct CertSigner(pub(crate) std::sync::Arc<SignFn>);
+
+impl std::fmt::Debug for CertSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CertSigner")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Plan {
     policy: Policy,
@@ -95,6 +108,9 @@ pub(crate) struct Plan {
     socket: PathBuf,
     known_hosts: String,
     tools: Toolset,
+    /// Set in certificate mode: the agent gets one fresh signed key instead
+    /// of `policy.keys`.
+    cert: Option<CertSigner>,
 }
 
 #[derive(Clone, Debug)]
@@ -415,15 +431,7 @@ pub(crate) fn validate_policy(policy: &Policy) -> Result<(), String> {
     if policy.keys.is_empty() {
         return Err("Restricted SSH has no selected key".into());
     }
-    if !(60..=86_400).contains(&policy.lifetime_seconds) {
-        return Err(
-            "Restricted SSH lifetime must be between 60 and 86400 seconds"
-                .into(),
-        );
-    }
-    if policy.destinations.is_empty() {
-        return Err("Selected-key SSH requires at least one verified destination; unconstrained agent authority is not an ALLOWED grant".into());
-    }
+    validate_limits(policy)?;
     for key in &policy.keys {
         let current = capture_key(&key.private_path)?;
         if &current != key {
@@ -434,6 +442,21 @@ pub(crate) fn validate_policy(policy: &Policy) -> Result<(), String> {
                     .unwrap_or_else(|_| "[unsafe path]".into())
             ));
         }
+    }
+    Ok(())
+}
+
+/// Lifetime and destination rules shared by selected-key and certificate
+/// mode.
+fn validate_limits(policy: &Policy) -> Result<(), String> {
+    if !(60..=86_400).contains(&policy.lifetime_seconds) {
+        return Err(
+            "Restricted SSH lifetime must be between 60 and 86400 seconds"
+                .into(),
+        );
+    }
+    if policy.destinations.is_empty() {
+        return Err("Selected-key SSH requires at least one verified destination; unconstrained agent authority is not an ALLOWED grant".into());
     }
     for destination in &policy.destinations {
         validate_destination(destination)?;
@@ -466,6 +489,27 @@ pub(crate) fn plan(
 ) -> Result<Plan, String> {
     validate_policy(&policy)?;
     plan_validated(policy, config, home)
+}
+
+/// Certificate mode: the launch generates a key, `signer` certifies it, and
+/// the agent holds only that key, bounded by `lifetime_seconds` and
+/// `destinations` exactly like selected keys.
+pub(crate) fn plan_cert(
+    signer: CertSigner,
+    lifetime_seconds: u32,
+    destinations: Vec<String>,
+    config: &mut Config,
+    home: &Path,
+) -> Result<Plan, String> {
+    let policy = Policy {
+        keys: Vec::new(),
+        lifetime_seconds,
+        destinations,
+    };
+    validate_limits(&policy)?;
+    let mut plan = plan_validated(policy, config, home)?;
+    plan.cert = Some(signer);
+    Ok(plan)
 }
 
 fn plan_validated(
@@ -557,6 +601,7 @@ fn plan_validated_with_tools(
         socket,
         known_hosts,
         tools,
+        cert: None,
     })
 }
 
@@ -657,7 +702,11 @@ fn collect_known_hosts_with(
 
 impl Plan {
     pub(crate) fn start(&self) -> Result<Runtime, String> {
-        validate_policy(&self.policy)?;
+        if self.cert.is_some() {
+            validate_limits(&self.policy)?;
+        } else {
+            validate_policy(&self.policy)?;
+        }
         self.start_validated()
     }
 
@@ -766,37 +815,27 @@ impl Plan {
         {
             return Err("This ssh-add does not support destination constraints; restricted SSH was not opened".into());
         }
-        for key in &self.policy.keys {
-            self.tools.add.verify()?;
-            let mut command = Command::new(&self.tools.add.path);
-            command
-                .env_clear()
-                .env("SSH_AUTH_SOCK", &self.socket)
-                .env("SSH_ASKPASS_REQUIRE", "never")
-                .args(["-t", &self.policy.lifetime_seconds.to_string()]);
-            if constrained {
-                command
-                    .args(["-H"])
-                    .arg(self.public_dir.join("known_hosts"));
-                for destination in &self.policy.destinations {
-                    command.args(["-h", destination]);
-                }
-            }
-            let status = command
-                .arg(&key.private_path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map_err(|e| format!("Cannot run ssh-add: {e}"))?;
-            if !status.success() {
-                return Err(format!(
-                    "ssh-add refused selected key {}",
-                    crate::onboarding::safe_path(&key.public_path)
-                        .unwrap_or_else(|_| "[unsafe path]".into())
-                ));
+        let identities: Vec<(PathBuf, String, String)> = match &self.cert {
+            Some(signer) => vec![self.sign_key(signer)?],
+            None => self
+                .policy
+                .keys
+                .iter()
+                .map(|key| {
+                    let label = crate::onboarding::safe_path(&key.public_path)
+                        .unwrap_or_else(|_| "[unsafe path]".into());
+                    (key.private_path.clone(), key.fingerprint.clone(), label)
+                })
+                .collect(),
+        };
+        let loaded = self.add_identities(constrained, &identities);
+        if self.cert.is_some() {
+            // The agent holds the key now; the files are no longer needed.
+            for name in ["id", "id.pub", "id-cert.pub"] {
+                let _ = fs::remove_file(self.base.join(name));
             }
         }
+        loaded?;
         self.tools.add.verify()?;
         let output = Command::new(&self.tools.add.path)
             .env_clear()
@@ -814,18 +853,104 @@ impl Plan {
             .split_whitespace()
             .filter(|part| part.starts_with("SHA256:"))
             .collect();
-        if loaded.len() != self.policy.keys.len()
-            || self
-                .policy
-                .keys
+        // A certificate lists under its key's fingerprint, so match sets
+        // rather than counts.
+        if loaded.is_empty()
+            || loaded.iter().any(|fingerprint| {
+                !identities.iter().any(|(_, f, _)| f == fingerprint)
+            })
+            || identities
                 .iter()
-                .any(|key| !loaded.contains(&key.fingerprint.as_str()))
+                .any(|(_, f, _)| !loaded.contains(&f.as_str()))
         {
             return Err(
                 "Restricted ssh-agent loaded an unexpected identity".into()
             );
         }
         Ok(())
+    }
+
+    fn add_identities(
+        &self,
+        constrained: bool,
+        identities: &[(PathBuf, String, String)],
+    ) -> Result<(), String> {
+        for (private_path, _, label) in identities {
+            self.tools.add.verify()?;
+            let mut command = Command::new(&self.tools.add.path);
+            command
+                .env_clear()
+                .env("SSH_AUTH_SOCK", &self.socket)
+                .env("SSH_ASKPASS_REQUIRE", "never")
+                .args(["-t", &self.policy.lifetime_seconds.to_string()]);
+            if constrained {
+                command
+                    .args(["-H"])
+                    .arg(self.public_dir.join("known_hosts"));
+                for destination in &self.policy.destinations {
+                    command.args(["-h", destination]);
+                }
+            }
+            let status = command
+                .arg(private_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|e| format!("Cannot run ssh-add: {e}"))?;
+            if !status.success() {
+                return Err(format!("ssh-add refused selected key {label}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Generate a key in the private runtime directory (never mounted),
+    /// have it certified, and return it with its fingerprint. ssh-add picks
+    /// up `id-cert.pub` next to `id` on its own.
+    fn sign_key(
+        &self,
+        signer: &CertSigner,
+    ) -> Result<(PathBuf, String, String), String> {
+        let key = self.base.join("id");
+        let public = self.base.join("id.pub");
+        self.tools.keygen.verify()?;
+        let mut generate = Command::new(&self.tools.keygen.path);
+        generate
+            .env_clear()
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "ai-jail", "-f"])
+            .arg(&key)
+            .stdin(Stdio::null());
+        let output = run_tool(&mut generate)
+            .map_err(|e| format!("Cannot run ssh-keygen: {e}"))?;
+        if !output.status.success() {
+            return Err("ssh-keygen could not create the key to sign".into());
+        }
+        let public_key = fs::read_to_string(&public)
+            .map_err(|e| format!("Cannot read the generated SSH key: {e}"))?;
+        let cert = (signer.0)(public_key.trim(), self.policy.lifetime_seconds)?;
+        write_private(
+            &self.base.join("id-cert.pub"),
+            format!("{}\n", cert.trim()).as_bytes(),
+        )?;
+        self.tools.keygen.verify()?;
+        let mut inspect = Command::new(&self.tools.keygen.path);
+        inspect
+            .env_clear()
+            .args(["-l", "-E", "sha256", "-f"])
+            .arg(&public)
+            .stdin(Stdio::null());
+        let output = run_tool(&mut inspect)
+            .map_err(|e| format!("Cannot run ssh-keygen: {e}"))?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let fingerprint = text
+            .split_whitespace()
+            .find(|part| part.starts_with("SHA256:"))
+            .filter(|_| output.status.success())
+            .ok_or_else(|| {
+                "ssh-keygen did not fingerprint the generated key".to_string()
+            })?;
+        Ok((key, fingerprint.to_string(), "(signed certificate)".into()))
     }
 }
 
@@ -1067,6 +1192,82 @@ mod tests {
         assert!(args.contains(private.to_str().unwrap()));
         assert!(!args.contains("-c"));
         assert!(!args.contains("SSH_AUTH_SOCK"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cert_mode_signs_a_fresh_key_and_loads_it_constrained() {
+        let root = test_tmp().join(format!(
+            "ai-jail-ssh-cert-{}-{}",
+            std::process::id(),
+            PLAN_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("args.log");
+        let write = |name: &str, body: String| {
+            let path = root.join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .unwrap();
+            path
+        };
+        // Fake ssh-keygen: `-f PATH` creates the key pair; `-l` prints a
+        // fingerprint.
+        let keygen = write(
+            "fake-keygen",
+            "#!/bin/sh\nif [ \"$1\" = '-l' ]; then echo '256 SHA256:fresh ai-jail (ED25519)'; exit 0; fi\nfor a; do last=\"$a\"; done\necho private > \"$last\"\necho 'ssh-ed25519 AAAAFRESH ai-jail' > \"$last.pub\"\n".into(),
+        );
+        let add = write(
+            "fake-add",
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = '-?' ]; then echo 'usage: -h destination_constraint -H hostkey_file' >&2; exit 1; fi\nif [ \"$1\" = '-l' ]; then echo '256 SHA256:fresh ai-jail (ED25519)'; echo '256 SHA256:fresh ai-jail (ED25519-CERT)'; exit 0; fi\nfor a; do last=\"$a\"; done\ntest -f \"$last-cert.pub\" || exit 1\n",
+                log.display()
+            ),
+        );
+        add_known_hosts(&root);
+        let mut config = Config::default();
+        let signed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = signed.clone();
+        let signer = CertSigner(std::sync::Arc::new(move |public, ttl| {
+            seen.lock().unwrap().push(format!("{public} {ttl}"));
+            Ok("ssh-ed25519-cert-v01@openssh.com AAAACERT".into())
+        }));
+        let mut plan = plan_validated_with_tools(
+            Policy {
+                keys: vec![],
+                lifetime_seconds: 600,
+                destinations: vec![],
+            },
+            &mut config,
+            &root,
+            Toolset::fixture(&root),
+        )
+        .unwrap();
+        plan.policy.destinations = vec!["git@example.test".into()];
+        plan.cert = Some(signer);
+        plan.tools.keygen = TrustedTool::fixture(keygen);
+        plan.tools.add = TrustedTool::fixture(add);
+        plan.base = root.join("runtime");
+        plan.public_dir = root.join("public");
+        fs::create_dir(&plan.base).unwrap();
+        fs::create_dir(&plan.public_dir).unwrap();
+        fs::write(plan.public_dir.join("known_hosts"), "host key fixture\n")
+            .unwrap();
+        plan.load_keys().unwrap();
+        assert_eq!(
+            *signed.lock().unwrap(),
+            vec!["ssh-ed25519 AAAAFRESH ai-jail 600".to_string()]
+        );
+        let args = fs::read_to_string(log).unwrap();
+        assert!(args.contains("-t 600"));
+        assert!(args.contains("-h git@example.test"));
+        assert!(args.contains(plan.base.join("id").to_str().unwrap()));
+        // The generated key and certificate do not outlive the load.
+        assert!(!plan.base.join("id").exists());
+        assert!(!plan.base.join("id-cert.pub").exists());
+        // Without a key, only certificate mode may start.
+        assert!(validate_policy(&plan.policy).is_err());
+        assert!(validate_limits(&plan.policy).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 

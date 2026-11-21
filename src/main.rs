@@ -312,6 +312,61 @@ type SecretFetch<'a> = dyn Fn(
     ) -> Result<Vec<(String, String)>, String>
     + 'a;
 
+/// Build the OpenBao signer for `ssh_cert_role`. Native SSH cannot use
+/// filtered egress, so without unrestricted network the role is skipped
+/// (noted only with --verbose) instead of failing every offline launch.
+fn ssh_cert_signer(
+    config: &config::Config,
+    token: Option<String>,
+    verbose: bool,
+) -> Result<Option<ssh_restricted::CertSigner>, String> {
+    let Some(role) = config.ssh_cert_role.clone() else {
+        return Ok(None);
+    };
+    if !config.network_enabled() {
+        if verbose {
+            output::verbose(
+                "SSH certificates are off: they need unrestricted network",
+            );
+        }
+        return Ok(None);
+    }
+    crate::secret_provider::validate_ssh_role(&role)?;
+    if config.ssh_cert_hosts.is_empty() {
+        return Err("--ssh-cert-role needs at least one --ssh-cert-host \
+             (or ssh_cert_hosts in the global config)"
+            .into());
+    }
+    if let Some(kind) = config.secrets_provider_type.as_deref()
+        && crate::secret_provider::Kind::parse(kind)?
+            != crate::secret_provider::Kind::OpenBao
+    {
+        return Err("--ssh-cert-role needs the openbao secret provider".into());
+    }
+    let url = config.secrets_provider_url.as_deref().ok_or(
+        "--ssh-cert-role needs --secret-provider-url (or \
+         secrets_provider_url in the global config)",
+    )?;
+    let base = crate::secret_provider::parse_url(url)?;
+    let ca = config.secrets_provider_ca.clone();
+    if ca.as_ref().is_some_and(|ca| !ca.is_absolute()) {
+        return Err("secrets_provider_ca must be an absolute path".into());
+    }
+    Ok(Some(ssh_restricted::CertSigner(std::sync::Arc::new(
+        move |public, ttl| {
+            let token = require_provider_token(&token)?;
+            crate::secret_provider::sign_ssh_key(
+                &base,
+                ca.as_deref(),
+                &token,
+                &role,
+                public,
+                &format!("{ttl}s"),
+            )
+        },
+    ))))
+}
+
 /// `--secret-provider`: resolve bare `NAME` entries in `env_pass`
 /// against the configured vault, on the host, before the sandbox
 /// starts. `fetch` is injected so tests can fake the provider.
@@ -883,7 +938,7 @@ pub(crate) fn finalize_launch_config(
     project: &std::path::Path,
     dry_run: bool,
 ) -> Result<FinalizedLaunch, String> {
-    finalize_launch_config_with_ssh(config, project, dry_run, None)
+    finalize_launch_config_with_ssh(config, project, dry_run, None, None)
 }
 
 pub(crate) fn finalize_launch_config_with_ssh(
@@ -891,6 +946,7 @@ pub(crate) fn finalize_launch_config_with_ssh(
     project: &std::path::Path,
     dry_run: bool,
     restricted_ssh: Option<ssh_restricted::Policy>,
+    ssh_cert: Option<ssh_restricted::CertSigner>,
 ) -> Result<FinalizedLaunch, String> {
     if config.lockdown_enabled() {
         forge_auth::strip_runtime(&mut config);
@@ -1000,7 +1056,7 @@ pub(crate) fn finalize_launch_config_with_ssh(
     }
     let restricted_ssh = if config.ssh_enabled() || config.lockdown_enabled() {
         None
-    } else if let Some(policy) = restricted_ssh {
+    } else if restricted_ssh.is_some() || ssh_cert.is_some() {
         if !config.network_enabled() {
             return Err(format!(
                 "{} Selected-key SSH needs Unrestricted network (OPEN): filtered egress carries HTTP(S), not native SSH. Enable it knowingly or disable SSH.",
@@ -1010,7 +1066,23 @@ pub(crate) fn finalize_launch_config_with_ssh(
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .ok_or_else(|| "HOME is required for restricted SSH".to_string())?;
-        Some(ssh_restricted::plan(policy, &mut config, &home)?)
+        // A project's own selected keys win over the global certificate
+        // role.
+        Some(match (restricted_ssh, ssh_cert) {
+            (Some(policy), _) => {
+                ssh_restricted::plan(policy, &mut config, &home)?
+            }
+            (None, Some(signer)) => ssh_restricted::plan_cert(
+                signer,
+                config
+                    .ssh_cert_ttl
+                    .unwrap_or(ssh_restricted::DEFAULT_LIFETIME_SECONDS),
+                config.ssh_cert_hosts.clone(),
+                &mut config,
+                &home,
+            )?,
+            (None, None) => unreachable!("checked above"),
+        })
     } else {
         None
     };
@@ -1980,8 +2052,19 @@ fn run(
         return Ok(0);
     }
 
+    let ssh_cert = if cli.ssh == Some(false) {
+        None
+    } else {
+        ssh_cert_signer(&config, provider_token.clone(), cli.verbose)?
+    };
     let finalized = match prepared_launch.take() {
         Some(finalized) => {
+            if config.ssh_cert_role.is_some() {
+                output::warn(
+                    "SSH certificates are not set up on the first-run \
+                     setup launch; launch again to use them",
+                );
+            }
             if cli.use_secret_provider {
                 return Err(
                     "--secret-provider is not applied on the first-run \
@@ -2027,6 +2110,7 @@ fn run(
             } else {
                 stored_ssh_for_launch
             },
+            ssh_cert,
         )?,
     };
     let mut launch_runner = LaunchRunner::new(finalized);

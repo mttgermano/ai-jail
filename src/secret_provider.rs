@@ -10,11 +10,13 @@
 //! falls back to the local environment, and the provider token never
 //! reaches the sandbox.
 
-use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
-use std::path::Path;
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+    net::{IpAddr, TcpStream, ToSocketAddrs},
+    path::Path,
+    time::Duration,
+};
 
 /// Which vault backend to talk to. Stored in config as a string and
 /// parsed at use time, so an old binary reading a newer type string
@@ -224,6 +226,142 @@ pub fn validate_ref(kind: Kind, r: &str) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// Validate an OpenBao SSH signing role: `mount/role`, where the mount
+/// may itself be nested (`infra/ssh/ai-agent`: the mount is `infra/ssh`
+/// and the role is `ai-agent`). Both parts must be non-empty, neither
+/// may be `.` or `..`, no control characters and no empty path
+/// segment. The role is trusted config, but this keeps it from
+/// escaping the signing endpoint it names.
+pub fn validate_ssh_role(role: &str) -> Result<(), String> {
+    // The mount may contain slashes; the role name may not. The last
+    // slash separates the two.
+    let Some((mount, name)) = role.rsplit_once('/') else {
+        return Err(format!("ssh cert role must be mount/role, not {role:?}"));
+    };
+    if name.is_empty() {
+        return Err(format!("empty role in ssh cert role {role:?}"));
+    }
+    if name == "." || name == ".." {
+        return Err(format!("role in ssh cert role must not be {name:?}"));
+    }
+    if name.bytes().any(|b| b.is_ascii_control()) {
+        return Err("role in ssh cert role contains a control character".into());
+    }
+    if mount.is_empty() {
+        return Err(format!("empty mount in ssh cert role {role:?}"));
+    }
+    for segment in mount.split('/') {
+        if segment.is_empty() {
+            return Err(format!(
+                "ssh cert role has an empty mount segment, not {role:?}"
+            ));
+        }
+        if segment == "." || segment == ".." {
+            return Err(format!(
+                "mount in ssh cert role must not contain {segment:?}"
+            ));
+        }
+        if segment.bytes().any(|b| b.is_ascii_control()) {
+            return Err(
+                "mount in ssh cert role contains a control character".into()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Percent-encode each segment of a mount path, keeping the slashes
+/// between them: a nested mount (`infra/ssh`) is one path in OpenBao,
+/// not one segment with an encoded slash.
+fn percent_encode_path(path: &str) -> String {
+    path.split('/')
+        .map(percent_encode)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Sign an OpenSSH public key with OpenBao's SSH secrets engine:
+/// `POST /v1/<mount>/sign/<role>` with `{"public_key", "ttl"}` →
+/// `.data.signed_key`, which must look like an OpenSSH certificate.
+/// Errors name the role and the HTTP status only — never the token,
+/// the response body or the key.
+pub fn sign_ssh_key(
+    base: &Base,
+    ca_path: Option<&Path>,
+    token: &str,
+    role: &str,
+    public_key: &str,
+    ttl: &str,
+) -> Result<String, String> {
+    validate_ssh_role(role)?;
+    if token.bytes().any(|b| b.is_ascii_control()) {
+        return Err("secret provider token contains a control character".into());
+    }
+    if public_key.is_empty() || public_key.bytes().any(|b| b.is_ascii_control())
+    {
+        return Err(format!(
+            "ssh cert role {role}: public key is empty or contains a control character"
+        ));
+    }
+    if ttl.is_empty() || ttl.bytes().any(|b| b.is_ascii_control()) {
+        return Err(format!(
+            "ssh cert role {role}: ttl is empty or contains a control character"
+        ));
+    }
+    let (mount, name) = role.rsplit_once('/').expect("validated above");
+    let path = format!(
+        "/v1/{}/sign/{}",
+        percent_encode_path(mount),
+        percent_encode(name)
+    );
+    let body = serde_json::json!({
+        "public_key": public_key,
+        "ttl": ttl,
+    })
+    .to_string();
+    let response = http_request_json(
+        base,
+        ca_path,
+        "POST",
+        &[("X-Vault-Token", token)],
+        &path,
+        Some(body.as_bytes()),
+        IO_TIMEOUT,
+    )
+    .map_err(|e| format!("ssh cert role {role}: {e}"))?;
+    let signed = response
+        .get("data")
+        .and_then(|data| data.get("signed_key"))
+        .and_then(|key| key.as_str())
+        .ok_or_else(|| {
+            format!(
+                "ssh cert role {role}: response has no data.signed_key string"
+            )
+        })?;
+    let signed = signed.trim();
+    if !looks_like_openssh_cert(signed) {
+        return Err(format!(
+            "ssh cert role {role}: signed_key is not an OpenSSH certificate"
+        ));
+    }
+    Ok(signed.to_string())
+}
+
+/// An OpenSSH certificate is `ssh-<algo>-cert-v01@openssh.com <blob>`
+/// (optionally followed by a comment). Checking the type token and the
+/// presence of the base64 blob catches an empty or HTML error body
+/// without trying to parse the certificate itself.
+fn looks_like_openssh_cert(s: &str) -> bool {
+    let mut parts = s.split_whitespace();
+    let Some(kind) = parts.next() else {
+        return false;
+    };
+    if !kind.starts_with("ssh-") || !kind.contains("-cert-v01@openssh.com") {
+        return false;
+    }
+    parts.next().is_some_and(|blob| !blob.is_empty())
 }
 
 /// Percent-encode a path segment for a request URL. Kept local so the
@@ -618,10 +756,30 @@ fn http_get_json_with(
     path: &str,
     read_timeout: Duration,
 ) -> Result<serde_json::Value, String> {
+    http_request_json(base, ca_path, "GET", headers, path, None, read_timeout)
+}
+
+/// Issue one authenticated request against the provider and parse the
+/// response body as JSON. `path` must start with `/` and already be
+/// percent-encoded. An optional `body` is sent as JSON (the caller
+/// supplies the serialized bytes) with `Content-Type` and
+/// `Content-Length`. Non-2xx responses are an error that names only the
+/// HTTP status; the body is never echoed into errors, so neither a
+/// secret value nor the token can leak through a message.
+#[allow(clippy::too_many_arguments)]
+fn http_request_json(
+    base: &Base,
+    ca_path: Option<&Path>,
+    method: &str,
+    headers: &[(&str, &str)],
+    path: &str,
+    body: Option<&[u8]>,
+    read_timeout: Duration,
+) -> Result<serde_json::Value, String> {
     let mut stream = connect(base, ca_path, read_timeout)?;
     let host_header = host_header(base);
     let mut req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n"
     );
     for (name, value) in headers {
         req.push_str(name);
@@ -629,10 +787,19 @@ fn http_get_json_with(
         req.push_str(value);
         req.push_str("\r\n");
     }
+    if let Some(body) = body {
+        req.push_str("Content-Type: application/json\r\n");
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
     req.push_str("\r\n");
     stream
         .write_all(req.as_bytes())
         .map_err(|e| format!("provider request failed: {e}"))?;
+    if let Some(body) = body {
+        stream
+            .write_all(body)
+            .map_err(|e| format!("provider request failed: {e}"))?;
+    }
     stream
         .flush()
         .map_err(|e| format!("provider request failed: {e}"))?;
@@ -1030,6 +1197,33 @@ mod tests {
     }
 
     #[test]
+    fn ssh_role_validation() {
+        assert!(validate_ssh_role("ssh/ai-agent").is_ok());
+        assert!(validate_ssh_role("ssh/role with space").is_ok());
+        // A nested mount is allowed: the last slash separates the role.
+        assert!(validate_ssh_role("infra/ssh/ai-agent").is_ok());
+        assert!(validate_ssh_role("ssh").is_err());
+        assert!(validate_ssh_role("ssh/").is_err());
+        assert!(validate_ssh_role("/ai-agent").is_err());
+        assert!(validate_ssh_role("ssh//ai-agent").is_err());
+        assert!(validate_ssh_role("ssh/..").is_err());
+        assert!(validate_ssh_role("../ai-agent").is_err());
+        assert!(validate_ssh_role("ssh/ai\u{1b}agent").is_err());
+    }
+
+    #[test]
+    fn openssh_cert_shape() {
+        assert!(looks_like_openssh_cert(
+            "ssh-ed25519-cert-v01@openssh.com AAAA comment"
+        ));
+        assert!(looks_like_openssh_cert("ssh-rsa-cert-v01@openssh.com AAAA"));
+        assert!(!looks_like_openssh_cert("ssh-ed25519 AAAA"));
+        assert!(!looks_like_openssh_cert("ssh-ed25519-cert-v01@openssh.com"));
+        assert!(!looks_like_openssh_cert(""));
+        assert!(!looks_like_openssh_cert("<html>error</html>"));
+    }
+
+    #[test]
     fn percent_encoding() {
         assert_eq!(percent_encode("Dev"), "Dev");
         assert_eq!(percent_encode("a b"), "a%20b");
@@ -1151,8 +1345,10 @@ mod tests {
 /// Tests for the OpenBao backend (canned JSON, no network).
 #[cfg(test)]
 mod openbao_tests {
-    use super::http_tests::{ca_path, tls_fixture};
-    use super::*;
+    use super::{
+        http_tests::{ca_path, tls_fixture},
+        *,
+    };
 
     const TOKEN: &str = "hvs.TOPSECRETTOKEN";
 
@@ -1389,7 +1585,158 @@ mod openbao_tests {
             "{reqs:?}"
         );
     }
-}
+
+    #[test]
+    fn sign_ssh_key_posts_role_and_relays_cert() {
+        let cert = "ssh-ed25519-cert-v01@openssh.com AAAACERT test";
+        let body =
+            serde_json::json!({"data": {"signed_key": cert}}).to_string();
+        let fx = tls_fixture(vec![Some(super::http_tests::cl_response(&body))]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        let pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBtest ai-jail";
+        let out = sign_ssh_key(
+            &base,
+            Some(&ca_path()),
+            TOKEN,
+            "ssh/ai-agent",
+            pubkey,
+            "10m",
+        )
+        .unwrap();
+        assert_eq!(out, cert);
+
+        let reqs = fx.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        let req = &reqs[0];
+        assert!(
+            req.starts_with("POST /v1/ssh/sign/ai-agent HTTP/1.1\r\n"),
+            "{req}"
+        );
+        assert!(req.contains("Content-Type: application/json\r\n"), "{req}");
+        assert!(
+            req.contains(&format!("X-Vault-Token: {TOKEN}\r\n")),
+            "{req}"
+        );
+        let expected = format!(r#"{{"public_key":"{pubkey}","ttl":"10m"}}"#);
+        assert!(
+            req.contains(&format!("Content-Length: {}\r\n", expected.len())),
+            "{req}"
+        );
+        assert!(req.ends_with(&expected), "{req}");
+    }
+
+    #[test]
+    fn sign_ssh_key_accepts_a_nested_mount() {
+        // OpenBao allows a nested mount: `infra/ssh/ai-agent` is the
+        // role `ai-agent` in the mount `infra/ssh`.
+        let cert = "ssh-ed25519-cert-v01@openssh.com AAAACERT test";
+        let body =
+            serde_json::json!({"data": {"signed_key": cert}}).to_string();
+        let fx = tls_fixture(vec![Some(super::http_tests::cl_response(&body))]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        let pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBtest ai-jail";
+        let out = sign_ssh_key(
+            &base,
+            Some(&ca_path()),
+            TOKEN,
+            "infra/ssh/ai-agent",
+            pubkey,
+            "10m",
+        )
+        .unwrap();
+        assert_eq!(out, cert);
+
+        let reqs = fx.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert!(
+            reqs[0]
+                .starts_with("POST /v1/infra/ssh/sign/ai-agent HTTP/1.1\r\n"),
+            "{reqs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_ssh_role_splits_on_the_last_slash() {
+        assert!(validate_ssh_role("ssh/ai-agent").is_ok());
+        assert!(validate_ssh_role("infra/ssh/ai-agent").is_ok());
+        for bad in [
+            "ai-agent",
+            "/ai-agent",
+            "infra/",
+            "infra//ai-agent",
+            "infra/../ai-agent",
+            "infra/./ai-agent",
+            "../ai-agent",
+            "infra/ai-agent/../other",
+        ] {
+            assert!(validate_ssh_role(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn sign_ssh_key_hides_token_on_http_error() {
+        let fx = tls_fixture(vec![Some(super::http_tests::status_response(
+            403,
+            "Forbidden",
+            "permission denied: token lacks capability",
+        ))]);
+        let base =
+            parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+        let err = sign_ssh_key(
+            &base,
+            Some(&ca_path()),
+            TOKEN,
+            "ssh/ai-agent",
+            "ssh-ed25519 AAAAB3Nza test",
+            "10m",
+        )
+        .unwrap_err();
+        assert!(err.contains("ssh/ai-agent"), "{err}");
+        assert!(err.contains("403"), "{err}");
+        assert!(!err.contains(TOKEN), "{err}");
+        assert!(!err.contains("permission denied"), "{err}");
+    }
+
+    #[test]
+    fn sign_ssh_key_rejects_missing_and_non_cert_values() {
+        for (body, want) in [
+            (
+                serde_json::json!({"data": {}}).to_string(),
+                "data.signed_key",
+            ),
+            (
+                serde_json::json!({"data": {"signed_key": "not a certificate"}})
+                    .to_string(),
+                "not an OpenSSH certificate",
+            ),
+            (
+                serde_json::json!({"data": {"signed_key": 42}}).to_string(),
+                "data.signed_key",
+            ),
+        ] {
+            let fx =
+                tls_fixture(vec![Some(super::http_tests::cl_response(&body))]);
+            let base =
+                parse_url(&format!("https://localhost:{}", fx.port)).unwrap();
+            let err = sign_ssh_key(
+                &base,
+                Some(&ca_path()),
+                TOKEN,
+                "ssh/ai-agent",
+                "ssh-ed25519 AAAAB3Nza test",
+                "10m",
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("ssh/ai-agent") && err.contains(want),
+                "{err}"
+            );
+            assert!(!err.contains(TOKEN), "{err}");
+        }
+    }
+} // openbao_tests
 
 /// Tests for the 1Password Connect backend (canned JSON, no network).
 #[cfg(test)]
@@ -1634,12 +1981,15 @@ mod onepassword_tests {
 /// serving canned responses from the repo's test-only certificate.
 #[cfg(test)]
 mod http_tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{Arc, Mutex},
+        thread,
+        time::Duration,
+    };
+
     use super::{http_get_json, http_get_json_with, parse_url};
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::time::Duration;
 
     /// A running TLS fixture: its port plus every request head received,
     /// in connection order.
@@ -1654,8 +2004,9 @@ mod http_tests {
     /// An exhausted queue closes the connection. Each call gets a fresh
     /// listener on 127.0.0.1:0.
     pub(crate) fn tls_fixture(responses: Vec<Option<String>>) -> Fixture {
-        use rustls::pki_types::pem::PemObject;
         use std::collections::VecDeque;
+
+        use rustls::pki_types::pem::PemObject;
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
         let cert = rustls::pki_types::CertificateDer::from_pem_slice(
             &std::fs::read(format!("{dir}/test-only-cert.pem")).unwrap(),
@@ -1690,15 +2041,38 @@ mod http_tests {
                     let mut tls = rustls::StreamOwned::new(server_conn, conn);
                     let mut buf = Vec::new();
                     let mut chunk = [0_u8; 4096];
-                    loop {
+                    let header_end = loop {
                         match tls.read(&mut chunk) {
                             Ok(0) | Err(_) => return,
                             Ok(n) => {
                                 buf.extend_from_slice(&chunk[..n]);
-                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                                    break;
+                                if let Some(pos) = buf
+                                    .windows(4)
+                                    .position(|w| w == b"\r\n\r\n")
+                                {
+                                    break pos + 4;
                                 }
                             }
+                        }
+                    };
+                    // Read the JSON body too, so request-shape tests can
+                    // assert on it. Content-Length is always present for
+                    // bodies our client sends.
+                    let head = String::from_utf8_lossy(&buf[..header_end]);
+                    let content_length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    let total = header_end + content_length;
+                    while buf.len() < total {
+                        match tls.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
                         }
                     }
                     requests
