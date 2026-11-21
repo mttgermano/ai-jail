@@ -987,8 +987,13 @@ fn restricted_ssh_grant(
         .collect::<Vec<_>>()
         .join(", ");
     let constrained = !policy.destinations.is_empty();
+    let cert = policy.openbao_cert;
     GrantSpec {
-        resource: format!("Fresh SSH agent containing only {fingerprints}"),
+        resource: if cert {
+            "Fresh SSH agent holding one key signed by OpenBao (ssh_cert_role) for each launch".into()
+        } else {
+            format!("Fresh SSH agent containing only {fingerprints}")
+        },
         access: "Request signatures; private key files and the ambient agent stay outside the jail".into(),
         process: process_label(harness),
         duration: format!(
@@ -1010,10 +1015,22 @@ fn restricted_ssh_grant(
         } else {
             "No raw selected-key agent is exposed without an enforced OpenSSH destination constraint".into()
         },
-        default: "Disabled until keys are selected in trusted configuration".into(),
-        consequence: "The harness can authenticate as accounts accepted by the selected keys during this jail run".into(),
+        default: if cert {
+            "Disabled until the OpenBao certificate is selected in trusted configuration".into()
+        } else {
+            "Disabled until keys are selected in trusted configuration".into()
+        },
+        consequence: if cert {
+            "The harness can authenticate as the certificate's principals at these destinations during this jail run".into()
+        } else {
+            "The harness can authenticate as accounts accepted by the selected keys during this jail run".into()
+        },
         remote: constrained.then(|| policy.destinations.join(", ")),
-        authority: Some("Only accounts accepted by the selected fingerprints".into()),
+        authority: Some(if cert {
+            "Only accounts whose server trusts the OpenBao CA and accepts the role's principals".into()
+        } else {
+            "Only accounts accepted by the selected fingerprints".into()
+        }),
         risk: Risk::Allowed,
     }
 }
@@ -3008,6 +3025,21 @@ mod tests {
             project_strategy: crate::config::ProjectStrategy::Basename,
             root,
         }
+    }
+
+    #[test]
+    fn certificate_ssh_grant_does_not_describe_key_files() {
+        let policy = crate::ssh_restricted::Policy {
+            keys: vec![],
+            lifetime_seconds: 3600,
+            destinations: vec!["git@git.example".into()],
+            openbao_cert: true,
+        };
+        let text = restricted_ssh_grant(&policy, "claude", Some(true)).render();
+        assert!(text.contains("signed by OpenBao"), "{text}");
+        assert!(text.contains("OpenBao CA"), "{text}");
+        assert!(!text.contains("containing only"), "{text}");
+        assert!(!text.contains("fingerprints"), "{text}");
     }
 
     #[test]
