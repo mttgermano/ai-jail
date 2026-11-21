@@ -290,6 +290,15 @@ fn take_provider_token() -> Option<String> {
 
 /// The fetch path's token check: a missing or empty token is an error
 /// with a hint, raised only when something is actually fetched.
+/// The vault token captured (and scrubbed from the environment) at startup;
+/// read by the secret fetch and SSH signing wherever a launch is finalized.
+static PROVIDER_TOKEN: std::sync::OnceLock<Option<String>> =
+    std::sync::OnceLock::new();
+
+fn provider_token() -> Result<String, String> {
+    require_provider_token(PROVIDER_TOKEN.get().unwrap_or(&None))
+}
+
 fn require_provider_token(token: &Option<String>) -> Result<String, String> {
     const HINT: &str = "export AI_JAIL_SECRET_TOKEN=<provider token>";
     match token {
@@ -312,59 +321,43 @@ type SecretFetch<'a> = dyn Fn(
     ) -> Result<Vec<(String, String)>, String>
     + 'a;
 
-/// Build the OpenBao signer for `ssh_cert_role`. Native SSH cannot use
-/// filtered egress, so without unrestricted network the role is skipped
-/// (noted only with --verbose) instead of failing every offline launch.
-fn ssh_cert_signer(
+/// Build the OpenBao signer for the global `ssh_cert_role`. The token is
+/// read only when a key is actually signed.
+pub(crate) fn ssh_cert_signer(
     config: &config::Config,
-    token: Option<String>,
-    verbose: bool,
-) -> Result<Option<ssh_restricted::CertSigner>, String> {
-    let Some(role) = config.ssh_cert_role.clone() else {
-        return Ok(None);
-    };
-    if !config.network_enabled() {
-        if verbose {
-            output::verbose(
-                "SSH certificates are off: they need unrestricted network",
-            );
-        }
-        return Ok(None);
-    }
+) -> Result<ssh_restricted::CertSigner, String> {
+    let role = config.ssh_cert_role.clone().ok_or(
+        "This project uses an OpenBao SSH certificate, but no ssh_cert_role \
+         is set in the global config",
+    )?;
     crate::secret_provider::validate_ssh_role(&role)?;
-    if config.ssh_cert_hosts.is_empty() {
-        return Err("--ssh-cert-role needs at least one --ssh-cert-host \
-             (or ssh_cert_hosts in the global config)"
-            .into());
-    }
     if let Some(kind) = config.secrets_provider_type.as_deref()
         && crate::secret_provider::Kind::parse(kind)?
             != crate::secret_provider::Kind::OpenBao
     {
-        return Err("--ssh-cert-role needs the openbao secret provider".into());
+        return Err("ssh_cert_role needs the openbao secret provider".into());
     }
     let url = config.secrets_provider_url.as_deref().ok_or(
-        "--ssh-cert-role needs --secret-provider-url (or \
-         secrets_provider_url in the global config)",
+        "ssh_cert_role needs secrets_provider_url in the global config \
+         (or --secret-provider-url)",
     )?;
     let base = crate::secret_provider::parse_url(url)?;
     let ca = config.secrets_provider_ca.clone();
     if ca.as_ref().is_some_and(|ca| !ca.is_absolute()) {
         return Err("secrets_provider_ca must be an absolute path".into());
     }
-    Ok(Some(ssh_restricted::CertSigner(std::sync::Arc::new(
+    Ok(ssh_restricted::CertSigner(std::sync::Arc::new(
         move |public, ttl| {
-            let token = require_provider_token(&token)?;
             crate::secret_provider::sign_ssh_key(
                 &base,
                 ca.as_deref(),
-                &token,
+                &provider_token()?,
                 &role,
                 public,
                 &format!("{ttl}s"),
             )
         },
-    ))))
+    )))
 }
 
 /// `--secret-provider`: resolve bare `NAME` entries in `env_pass`
@@ -396,7 +389,13 @@ fn apply_secret_provider(
     dry_run: bool,
     fetch: &SecretFetch<'_>,
 ) -> Result<(), String> {
-    if !use_provider {
+    // A requested name listed in secret_refs is a vault secret whether or not
+    // --secret-provider was passed (setup-screen approvals rely on this).
+    let requested = config.env_pass.iter().any(|entry| {
+        matches!(config::parse_env_entry(entry),
+            Ok((name, None)) if config.secret_refs.contains_key(name))
+    });
+    if !use_provider && !requested {
         return Ok(());
     }
     let Some(type_text) = config.secrets_provider_type.as_deref() else {
@@ -938,7 +937,7 @@ pub(crate) fn finalize_launch_config(
     project: &std::path::Path,
     dry_run: bool,
 ) -> Result<FinalizedLaunch, String> {
-    finalize_launch_config_with_ssh(config, project, dry_run, None, None)
+    finalize_launch_config_with_ssh(config, project, dry_run, None)
 }
 
 pub(crate) fn finalize_launch_config_with_ssh(
@@ -946,7 +945,6 @@ pub(crate) fn finalize_launch_config_with_ssh(
     project: &std::path::Path,
     dry_run: bool,
     restricted_ssh: Option<ssh_restricted::Policy>,
-    ssh_cert: Option<ssh_restricted::CertSigner>,
 ) -> Result<FinalizedLaunch, String> {
     if config.lockdown_enabled() {
         forge_auth::strip_runtime(&mut config);
@@ -1047,6 +1045,22 @@ pub(crate) fn finalize_launch_config_with_ssh(
     // Reserved even without --secret-provider, and checked after the
     // --env-from-file merge so a credential file cannot smuggle it.
     reject_provider_token_env_entry(&config)?;
+    // Requested names listed in secret_refs come from the vault, here so the
+    // setup-screen launch gets them too and prepare_secrets can phantom-bind
+    // them. --secret-provider itself is validated in run().
+    let ca = config.secrets_provider_ca.clone();
+    let fetch = move |kind: crate::secret_provider::Kind,
+                      base: &crate::secret_provider::Base,
+                      wanted: &[(String, String)]|
+          -> Result<Vec<(String, String)>, String> {
+        let token = provider_token()?;
+        // A launch that will fail anyway must not leave vault audit entries.
+        sandbox::check()?;
+        crate::secret_provider::fetch(kind, base, ca.as_deref(), &token, wanted)
+    };
+    if !dry_run {
+        apply_secret_provider(&mut config, false, dry_run, &fetch)?;
+    }
     let github = github_auth::prepare(&mut config, project, dry_run);
     if let Some(path) = github.config_dir.filter(|path| path.is_dir()) {
         let spec = path.to_string_lossy().into_owned();
@@ -1056,7 +1070,7 @@ pub(crate) fn finalize_launch_config_with_ssh(
     }
     let restricted_ssh = if config.ssh_enabled() || config.lockdown_enabled() {
         None
-    } else if restricted_ssh.is_some() || ssh_cert.is_some() {
+    } else if let Some(policy) = restricted_ssh {
         if !config.network_enabled() {
             return Err(format!(
                 "{} Selected-key SSH needs Unrestricted network (OPEN): filtered egress carries HTTP(S), not native SSH. Enable it knowingly or disable SSH.",
@@ -1066,22 +1080,11 @@ pub(crate) fn finalize_launch_config_with_ssh(
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .ok_or_else(|| "HOME is required for restricted SSH".to_string())?;
-        // A project's own selected keys win over the global certificate
-        // role.
-        Some(match (restricted_ssh, ssh_cert) {
-            (Some(policy), _) => {
-                ssh_restricted::plan(policy, &mut config, &home)?
-            }
-            (None, Some(signer)) => ssh_restricted::plan_cert(
-                signer,
-                config
-                    .ssh_cert_ttl
-                    .unwrap_or(ssh_restricted::DEFAULT_LIFETIME_SECONDS),
-                config.ssh_cert_hosts.clone(),
-                &mut config,
-                &home,
-            )?,
-            (None, None) => unreachable!("checked above"),
+        Some(if policy.openbao_cert {
+            let signer = ssh_cert_signer(&config)?;
+            ssh_restricted::plan_cert(signer, policy, &mut config, &home)?
+        } else {
+            ssh_restricted::plan(policy, &mut config, &home)?
         })
     } else {
         None
@@ -1167,14 +1170,19 @@ fn build_noninteractive_onboarding_effective(
     )
 }
 
+/// `global` is the trusted global config: names in its `secret_refs` (with a
+/// provider URL) come from the vault at launch, so they need no host value.
 fn materialize_approved_env_names(
     names: &[String],
+    global: &config::Config,
     allow_missing: bool,
 ) -> Result<Vec<String>, String> {
     let mut materialized = Vec::new();
     for name in names {
         onboarding::validate_env_name(name)?;
-        if std::env::var_os(name).is_some() {
+        if std::env::var_os(name).is_some()
+            || onboarding::vault_env_name(global, name)
+        {
             materialized.push(name.clone());
         } else if !allow_missing {
             return Err(format!(
@@ -1517,7 +1525,7 @@ fn run(
     // is used would leak the token on every other launch. The fetch
     // closure below uses the captured value; the provider being off
     // just means the token is dropped.
-    let provider_token = take_provider_token();
+    let _ = PROVIDER_TOKEN.set(take_provider_token());
 
     // Suppress info/warn output in --exec mode for clean stdout
     if cli.exec {
@@ -1631,8 +1639,15 @@ fn run(
         .cloned()
         .map(|message| ("directory_drift".into(), message))
         .collect();
+    // The global layer is merged later; vault names only need its refs.
+    let early_global = if store.global.exists() {
+        config_store::load_global(&store)?.base
+    } else {
+        config::Config::default()
+    };
     match materialize_approved_env_names(
         &stored_project.approved_env_names,
+        &early_global,
         cli.configure.is_some(),
     ) {
         Ok(env) => stored_project.grants.env_pass.extend(env),
@@ -1853,7 +1868,11 @@ fn run(
                 &profile.directory_grants,
                 store.policy_root(),
             )?;
-            materialize_approved_env_names(&profile.approved_env_names, false)?;
+            materialize_approved_env_names(
+                &profile.approved_env_names,
+                &global_for_onboarding,
+                false,
+            )?;
             let finalized = profile.finalized.take().ok_or_else(|| {
                 "Onboarding launch was not finalized before confirmation"
                     .to_string()
@@ -2052,65 +2071,38 @@ fn run(
         return Ok(0);
     }
 
-    let ssh_cert = if cli.ssh == Some(false) {
+    if cli.use_secret_provider
+        && (config.secrets_provider_type.is_none()
+            || config.secrets_provider_url.is_none())
+    {
+        return Err("--secret-provider needs a provider type and URL: pass \
+             --secret-provider-type/--secret-provider-url or set \
+             secrets_provider_type/secrets_provider_url in the global config"
+            .into());
+    }
+    // One-off certificate destinations from the CLI apply only when the
+    // project has no saved SSH choice of its own.
+    let restricted_ssh = if cli.ssh == Some(false) {
         None
+    } else if stored_ssh_for_launch.is_some() || cli.ssh_cert_hosts.is_empty() {
+        stored_ssh_for_launch
     } else {
-        ssh_cert_signer(&config, provider_token.clone(), cli.verbose)?
+        Some(ssh_restricted::Policy {
+            keys: Vec::new(),
+            lifetime_seconds: cli
+                .ssh_cert_ttl
+                .unwrap_or(ssh_restricted::DEFAULT_LIFETIME_SECONDS),
+            destinations: cli.ssh_cert_hosts.clone(),
+            openbao_cert: true,
+        })
     };
     let finalized = match prepared_launch.take() {
-        Some(finalized) => {
-            if config.ssh_cert_role.is_some() {
-                output::warn(
-                    "SSH certificates are not set up on the first-run \
-                     setup launch; launch again to use them",
-                );
-            }
-            if cli.use_secret_provider {
-                return Err(
-                    "--secret-provider is not applied on the first-run \
-                     setup launch; launch again to fetch secrets"
-                        .into(),
-                );
-            }
-            finalized
-        }
+        Some(finalized) => finalized,
         None => finalize_launch_config_with_ssh(
-            {
-                // Resolve bare --env NAME entries from the vault before
-                // finalize, so prepare_secrets can phantom-bind the values.
-                let ca = config.secrets_provider_ca.clone();
-                let fetch = move |kind: crate::secret_provider::Kind,
-                                  base: &crate::secret_provider::Base,
-                                  wanted: &[(String, String)]|
-                      -> Result<Vec<(String, String)>, String> {
-                    let token = require_provider_token(&provider_token)?;
-                    // A launch that will fail anyway must not leave vault
-                    // audit entries.
-                    sandbox::check()?;
-                    crate::secret_provider::fetch(
-                        kind,
-                        base,
-                        ca.as_deref(),
-                        &token,
-                        wanted,
-                    )
-                };
-                apply_secret_provider(
-                    &mut config,
-                    cli.use_secret_provider,
-                    cli.dry_run,
-                    &fetch,
-                )?;
-                config
-            },
+            config,
             &invocation_cwd,
             cli.dry_run,
-            if cli.ssh == Some(false) {
-                None
-            } else {
-                stored_ssh_for_launch
-            },
-            ssh_cert,
+            restricted_ssh,
         )?,
     };
     let mut launch_runner = LaunchRunner::new(finalized);
@@ -3159,9 +3151,32 @@ mod tests {
     }
 
     #[test]
-    fn secret_provider_flag_off_leaves_env_pass_alone() {
-        // Flag off is today's behavior: bare entries keep resolving
-        // against the local environment, refs are ignored, no fetch.
+    fn approved_vault_names_skip_the_host_value_check() {
+        let name = "AI_JAIL_TEST_VAULT_ONLY_9C21".to_string();
+        assert!(std::env::var_os(&name).is_none());
+        let mut global = provider_config();
+        global
+            .secret_refs
+            .insert(name.clone(), "secret/ai#k".into());
+        assert_eq!(
+            materialize_approved_env_names(
+                std::slice::from_ref(&name),
+                &global,
+                false
+            )
+            .unwrap(),
+            vec![name.clone()]
+        );
+        global.secrets_provider_url = None;
+        assert!(
+            materialize_approved_env_names(&[name], &global, false).is_err()
+        );
+    }
+
+    #[test]
+    fn secret_provider_fetches_requested_refs_without_the_flag() {
+        // A requested name listed in secret_refs is a vault secret even
+        // without --secret-provider (setup-screen approvals rely on it).
         let mut config = provider_config();
         config.env_pass = vec!["KEY".into()];
         config
@@ -3170,8 +3185,20 @@ mod tests {
         let calls = std::cell::Cell::new(0_usize);
         let fetch = recording_fetch(&calls);
         apply_secret_provider(&mut config, false, false, &fetch).unwrap();
-        assert_eq!(config.env_pass, vec!["KEY"]);
+        assert_eq!(calls.get(), 1);
+        assert_ne!(config.env_pass, vec!["KEY"]);
+
+        // Names outside secret_refs keep using the host value, no fetch.
+        let mut config = provider_config();
+        config.env_pass = vec!["OTHER".into()];
+        config
+            .secret_refs
+            .insert("KEY".into(), "secret/ai/k#value".into());
+        let calls = std::cell::Cell::new(0_usize);
+        let fetch = recording_fetch(&calls);
+        apply_secret_provider(&mut config, false, false, &fetch).unwrap();
         assert_eq!(calls.get(), 0);
+        assert_eq!(config.env_pass, vec!["OTHER"]);
     }
 
     #[test]
@@ -3983,14 +4010,21 @@ mod tests {
     fn missing_approved_environment_name_fails_closed_except_in_editor() {
         let name = "AI_JAIL_DEFINITELY_MISSING_APPROVED_ENV_7F4B".to_string();
         assert!(std::env::var_os(&name).is_none());
-        let error =
-            materialize_approved_env_names(std::slice::from_ref(&name), false)
-                .unwrap_err();
+        let error = materialize_approved_env_names(
+            std::slice::from_ref(&name),
+            &crate::config::Config::default(),
+            false,
+        )
+        .unwrap_err();
         assert!(error.contains(crate::onboarding::messages::ENV_MISSING_ID));
         assert!(
-            materialize_approved_env_names(&[name], true)
-                .unwrap()
-                .is_empty()
+            materialize_approved_env_names(
+                &[name],
+                &crate::config::Config::default(),
+                true,
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 

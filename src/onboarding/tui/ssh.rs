@@ -16,6 +16,10 @@ use ratatui::widgets::{
 };
 use std::collections::BTreeSet;
 
+/// Stand-in fingerprint for the OpenBao-signed certificate row: a key made
+/// and signed per launch, so it has no file or fingerprint yet.
+pub(super) const OPENBAO_ROW: &str = "openbao-certificate";
+
 const MIN_LIFETIME_SECONDS: u32 = 60;
 const MAX_LIFETIME_SECONDS: u32 = 86_400;
 const LIFETIME_STEP_SECONDS: u32 = 300;
@@ -579,6 +583,16 @@ fn render_header(frame: &mut Frame, editor: &Editor, area: Rect) {
     );
 }
 
+/// The OpenBao row has no key yet, so it shows its role instead of the
+/// internal marker.
+fn shown_fingerprint(identity: &IdentityRow) -> String {
+    if identity.fingerprint == OPENBAO_ROW {
+        "OpenBao".into()
+    } else {
+        escape_control_bytes(&identity.fingerprint)
+    }
+}
+
 fn render_available(frame: &mut Frame, editor: &mut Editor, area: Rect) {
     let items = editor.identities.iter().map(|identity| {
         let (mark, mark_style) = if identity.selected {
@@ -593,10 +607,7 @@ fn render_available(frame: &mut Frame, editor: &mut Editor, area: Rect) {
             ]),
             Line::from(vec![
                 Span::styled(
-                    format!(
-                        "  {}",
-                        escape_control_bytes(&identity.fingerprint)
-                    ),
+                    format!("  {}", shown_fingerprint(identity)),
                     muted(editor),
                 ),
                 Span::raw(if identity.comment.is_empty() {
@@ -629,7 +640,7 @@ fn render_selected(frame: &mut Frame, editor: &mut Editor, area: Rect) {
             Span::styled("✓ ", allowed(editor)),
             Span::raw(format!(
                 "{}  {}",
-                escape_control_bytes(&identity.fingerprint),
+                shown_fingerprint(identity),
                 escape_control_bytes(&identity.comment)
             )),
         ]))
@@ -683,6 +694,20 @@ fn security_detail(editor: &Editor) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    if editor.identities.iter().any(|identity| {
+        identity.selected && identity.fingerprint == OPENBAO_ROW
+    }) {
+        return format!(
+            "OpenBao SSH certificate\n\
+Shares\nA fresh SSH agent holding one key made and signed by OpenBao for each launch. No key file and not your normal host agent.\n\n\
+Can access\nAccounts whose server trusts the OpenBao CA and accepts the role's principals, only at verified destinations: {}\n\n\
+Key lifetime\n{} seconds (OpenBao may cap it lower), then the agent drops the key.\n\n\
+Also needed\nUnrestricted network access (OPEN) and AI_JAIL_SECRET_TOKEN at launch.\n\n\
+Safety\nLaunch is refused if signing, destination or host-key checks fail.\n\n\
+Risk\nThe jail can authenticate as the role's principals at those destinations for this run.",
+            destinations, editor.lifetime_seconds
+        );
+    }
     format!(
         "Selected-key SSH\n\
 Shares\nA fresh SSH agent containing only the keys you select. Private-key files and your normal host agent stay outside the jail.\n\n\

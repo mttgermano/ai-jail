@@ -23,6 +23,11 @@ or integration rather than saved sandbox authority.
 - Environment names: `--env`
 - Directory access: `--map`, `--rw-map`
 - Full SSH and the safer selected-key workflow: `--ssh`, `--no-ssh`
+- OpenBao SSH certificate: chosen per project as an identity in the SSH editor
+  when the global `ssh_cert_role` (`--ssh-cert-role`) is set; one-off
+  launches use `--ssh-cert-host` and `--ssh-cert-ttl`
+- Vault-backed environment names: names in the global `secret_refs`
+  (`--secret-ref`) appear in the environment picker marked `(OpenBao)`
 - Trusted wrapper requests are reviewed in the TUI: `--request`,
   `--request-file`
 - Additional capabilities screen:
@@ -64,8 +69,8 @@ or integration rather than saved sandbox authority.
 - Port bridges: `--forward-port`, `--publish-port`
 - Environment/secret sources: `--env-from-file`, `--secret`,
   `--secret-provider`, `--secret-provider-type`, `--secret-provider-url`,
-  `--secret-provider-ca`, `--secret-ref`, `--ssh-cert-role`,
-  `--ssh-cert-host`, `--ssh-cert-ttl`
+  `--secret-provider-ca` (the provider connection is global, trusted config;
+  the TUI only chooses which vault names and certificates a project uses)
 - Harness-specific path override: `--claude-dir`
 - Browser command/profile mode: `--browser`, `--no-browser` (command-specific;
   known browser commands are detected automatically, and dry-run output

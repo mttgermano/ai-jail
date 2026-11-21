@@ -3,7 +3,7 @@ use super::super::{
     apply_directory_candidate, apply_env_name, apply_wrapper_request,
     dependency_grant, discover_public_ssh_keys, environment_name_catalog,
     expand_home, list_directory, open_grant, prepare_directory_candidate,
-    prepare_env_candidate, prepare_wrapper_request, remove_directory_grant,
+    prepare_env_candidate_in, prepare_wrapper_request, remove_directory_grant,
     remove_env_name, revoke_wrapper_request, safe_path, state_grant,
     validate_ssh_destinations, validate_ssh_lifetime,
 };
@@ -19,7 +19,7 @@ use super::directory::{
 };
 use super::environment::{EnvironmentAction, EnvironmentSelector};
 use super::ssh::{
-    Editor as SshEditor, EditorAction as SshAction, IdentityRow,
+    Editor as SshEditor, EditorAction as SshAction, IdentityRow, OPENBAO_ROW,
     OperationRequest as SshRequest,
 };
 use super::wrapper::{WrapperAction, WrapperReview};
@@ -1589,13 +1589,21 @@ impl<'a> App<'a> {
                 self.environment = None;
             }
             EnvironmentAction::Prepare(name) => {
-                match prepare_env_candidate(&name, &self.harness) {
+                match prepare_env_candidate_in(
+                    self.selection,
+                    &name,
+                    &self.harness,
+                ) {
                     Ok(grant) => selector.set_preview(name, grant.render()),
                     Err(error) => selector.set_error(human_error(error)),
                 }
             }
             EnvironmentAction::Approve(name) => {
-                match prepare_env_candidate(&name, &self.harness) {
+                match prepare_env_candidate_in(
+                    self.selection,
+                    &name,
+                    &self.harness,
+                ) {
                     Ok(_) => apply_env_name(self.selection, name),
                     Err(error) => {
                         remove_env_name(self.selection, &name);
@@ -1657,6 +1665,10 @@ impl<'a> App<'a> {
                 Self::identity_row(identity, selected)
             })
             .collect();
+        let rows = self.with_openbao_row(
+            rows,
+            existing.as_ref().is_some_and(|policy| policy.openbao_cert),
+        );
         let destinations = existing
             .as_ref()
             .map_or_else(Vec::new, |policy| policy.destinations.clone());
@@ -1669,19 +1681,44 @@ impl<'a> App<'a> {
             Some(SshEditor::new(rows, destinations, lifetime, self.use_color));
     }
 
+    /// Offer the global OpenBao role as the first identity, when one is set.
+    fn with_openbao_row(
+        &self,
+        mut rows: Vec<IdentityRow>,
+        selected: bool,
+    ) -> Vec<IdentityRow> {
+        if let Some(role) = &self.selection.openbao_ssh_role {
+            rows.insert(
+                0,
+                IdentityRow {
+                    public_path: format!(
+                        "OpenBao certificate ({})",
+                        escape_control_bytes(role)
+                    ),
+                    fingerprint: OPENBAO_ROW.into(),
+                    comment: "fresh key signed each launch".into(),
+                    selected,
+                },
+            );
+        }
+        rows
+    }
+
     fn sync_ssh_policy(&mut self, editor: &SshEditor) {
         let selected = editor.selected_fingerprints();
+        let openbao_cert = selected.iter().any(|f| f == OPENBAO_ROW);
         let keys = self
             .ssh_identities
             .iter()
             .filter(|identity| selected.contains(&identity.fingerprint))
             .cloned()
             .collect::<Vec<_>>();
-        if keys.is_empty() {
+        if keys.is_empty() && !openbao_cert {
             self.selection.restricted_ssh = None;
             return;
         }
         self.selection.restricted_ssh = Some(crate::ssh_restricted::Policy {
+            openbao_cert,
             keys,
             destinations: editor.destinations(),
             lifetime_seconds: editor.lifetime_seconds(),
@@ -1728,6 +1765,10 @@ impl<'a> App<'a> {
                             )
                         })
                         .collect();
+                    let rows = self.with_openbao_row(
+                        rows,
+                        selected.iter().any(|f| f == OPENBAO_ROW),
+                    );
                     self.ssh_identities = identities;
                     editor.apply_discovered_identities(rows);
                 }
@@ -1745,6 +1786,8 @@ impl<'a> App<'a> {
                         } else {
                             self.ssh_identities.push(identity);
                         }
+                        // A captured key replaces the OpenBao certificate.
+                        editor.apply_identity_selected(OPENBAO_ROW, false);
                         editor.apply_captured_identity(row);
                         self.sync_ssh_policy(&editor);
                     }
@@ -1754,6 +1797,15 @@ impl<'a> App<'a> {
                     fingerprint,
                     selected,
                 } => {
+                    if selected {
+                        // A project uses either the certificate or file keys.
+                        let cert = fingerprint == OPENBAO_ROW;
+                        for other in editor.selected_fingerprints() {
+                            if (other == OPENBAO_ROW) != cert {
+                                editor.apply_identity_selected(&other, false);
+                            }
+                        }
+                    }
                     editor.apply_identity_selected(&fingerprint, selected);
                     self.sync_ssh_policy(&editor);
                 }
@@ -1794,10 +1846,13 @@ impl<'a> App<'a> {
                     Screen::RestrictedSsh
                 }
                 CapabilityId::Environment => {
-                    self.environment = Some(EnvironmentSelector::new(
-                        environment_name_catalog(self.selection),
-                        self.selection.env_names.clone(),
-                    ));
+                    self.environment = Some(
+                        EnvironmentSelector::new(
+                            environment_name_catalog(self.selection),
+                            self.selection.env_names.clone(),
+                        )
+                        .with_vault(self.selection.vault_env_names.clone()),
+                    );
                     Screen::Environment
                 }
                 CapabilityId::DirectoryAccess => {
@@ -2020,6 +2075,56 @@ mod tests {
         )
     }
     #[test]
+    fn openbao_certificate_is_an_exclusive_ssh_identity() {
+        let key = crate::ssh_restricted::KeyIdentity {
+            private_path: PathBuf::from("/keys/id_test"),
+            public_path: PathBuf::from("/keys/id_test.pub"),
+            fingerprint: "SHA256:TEST".into(),
+            comment: String::new(),
+            private_dev: 1,
+            private_ino: 2,
+            public_dev: 1,
+            public_ino: 3,
+        };
+        let mut s = Selection {
+            openbao_ssh_role: Some("ssh/ai-agent".into()),
+            ..Selection::default()
+        };
+        let mut a = app(&mut s);
+        let rows =
+            a.with_openbao_row(vec![App::identity_row(&key, false)], false);
+        assert_eq!(rows[0].fingerprint, OPENBAO_ROW);
+        assert!(rows[0].public_path.contains("ssh/ai-agent"));
+        a.ssh_identities = vec![key];
+        a.ssh = Some(SshEditor::new(rows, vec![], 3600, false));
+        a.screen = Screen::RestrictedSsh;
+
+        a.handle_key(KeyCode::Char(' '));
+        let policy = a.selection.restricted_ssh.clone().unwrap();
+        assert!(policy.openbao_cert);
+        assert!(policy.keys.is_empty());
+
+        // Selecting a file key drops the certificate, and back again.
+        a.handle_key(KeyCode::Down);
+        a.handle_key(KeyCode::Char(' '));
+        let policy = a.selection.restricted_ssh.clone().unwrap();
+        assert!(!policy.openbao_cert);
+        assert_eq!(policy.keys.len(), 1);
+        a.handle_key(KeyCode::Up);
+        a.handle_key(KeyCode::Char(' '));
+        let policy = a.selection.restricted_ssh.clone().unwrap();
+        assert!(policy.openbao_cert);
+        assert!(policy.keys.is_empty());
+    }
+
+    #[test]
+    fn no_openbao_row_without_a_global_role() {
+        let mut s = Selection::default();
+        let a = app(&mut s);
+        assert!(a.with_openbao_row(Vec::new(), false).is_empty());
+    }
+
+    #[test]
     fn catalog_has_all_unique_shortcuts() {
         assert_eq!(CapabilityId::ALL.len(), 13);
         let mut k = CapabilityId::ALL
@@ -2099,6 +2204,7 @@ mod tests {
             ro_dirs: vec![PathBuf::from("/srv/reference")],
             rw_dirs: vec![PathBuf::from("/srv/output")],
             restricted_ssh: Some(crate::ssh_restricted::Policy {
+                openbao_cert: false,
                 keys: vec![crate::ssh_restricted::KeyIdentity {
                     private_path: PathBuf::from("/keys/id_test"),
                     public_path: PathBuf::from("/keys/id_test.pub"),
@@ -2208,6 +2314,7 @@ mod tests {
             env_names: vec!["GH_TOKEN".into(), "SPOOF\n\x1b[31m".into()],
             ro_dirs: vec![PathBuf::from("/srv/reference files")],
             restricted_ssh: Some(crate::ssh_restricted::Policy {
+                openbao_cert: false,
                 keys: Vec::new(),
                 lifetime_seconds: 900,
                 destinations: vec!["git@example.test".into()],
@@ -2810,6 +2917,7 @@ mod tests {
     fn ssh_modes_are_mutually_exclusive() {
         let mut s = Selection {
             restricted_ssh: Some(crate::ssh_restricted::Policy {
+                openbao_cert: false,
                 keys: Vec::new(),
                 lifetime_seconds:
                     crate::ssh_restricted::DEFAULT_LIFETIME_SECONDS,
@@ -2824,6 +2932,7 @@ mod tests {
         assert!(a.selection.ssh);
         assert!(a.selection.restricted_ssh.is_none());
         a.apply_restricted_ssh(Some(crate::ssh_restricted::Policy {
+            openbao_cert: false,
             keys: Vec::new(),
             lifetime_seconds: crate::ssh_restricted::DEFAULT_LIFETIME_SECONDS,
             destinations: Vec::new(),

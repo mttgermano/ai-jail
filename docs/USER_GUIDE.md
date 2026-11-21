@@ -295,6 +295,11 @@ Search: CUSTOM█
 Esc clears search or returns  •  values never appear in this screen
 ```
 
+When the global config has a secret provider and `secret_refs`, those names
+also appear here, marked `(OpenBao)`. They need no host value: approving one
+makes every launch of this project fetch it from the vault on the host, and the
+launch fails if the fetch fails. Only the name is saved.
+
 Press `Down` from the search field to focus the matching names immediately.
 Typing again while the results are focused returns to the search field and
 continues the current query; `Enter` is not required to switch focus.
@@ -373,6 +378,13 @@ INCOMPLETE — launch and save are blocked
 │Selected-key SSH access (ALLOWED)                          │
 └──────────────────────────────────────────────────────────┘
 ```
+
+When the global config sets `ssh_cert_role`, the first identity is
+`OpenBao certificate (<role>)`. Selecting it means each launch makes a fresh
+key, has OpenBao sign it, and loads only that key into the fresh agent, with
+the same destinations and lifetime rules. It replaces file keys: selecting it
+clears selected keys, and selecting a key clears it. The launch needs
+`AI_JAIL_SECRET_TOKEN`.
 
 `Space` selects or removes an identity immediately; there is no second y/n
 prompt. Its authority remains visible in the security-detail pane. Destination

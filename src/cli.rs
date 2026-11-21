@@ -132,10 +132,11 @@ OPTIONS:
                                     sees a placeholder; the egress proxy substitutes the
                                     real value only for requests to host (repeatable;
                                     requires filtered egress via --allow-host)
-    --secret-provider               Fetch bare --env NAME values from a vault
+    --secret-provider               Require the vault: fail unless a provider
+                                    type and URL are set. Bare --env NAME values
+                                    listed in secret_refs are fetched from it
                                     (1Password Connect or OpenBao) on the host
-                                    before the sandbox starts; the provider
-                                    token never enters the sandbox
+                                    either way; the token never enters the jail
     --secret-provider-type <TYPE>   Provider backend: onepassword (op) or
                                     openbao (bao); or secrets_provider_type in
                                     the global config
@@ -149,12 +150,16 @@ OPTIONS:
                                     Dev/Item/field or secret/ai/key#field
                                     (repeatable; overrides secret_refs config
                                     entries; trusted config only)
-    --ssh-cert-role <MOUNT/ROLE>    Sign a fresh SSH key with this OpenBao role
-                                    at each launch (uses --secret-provider-url
-                                    and AI_JAIL_SECRET_TOKEN); needs --network
-    --ssh-cert-host <[USER@]HOST>   Destination the signed key may reach
-                                    (repeatable; needs a known_hosts entry)
-    --ssh-cert-ttl <SECONDS>        Certificate lifetime, 60-86400 (default 3600)
+    --ssh-cert-role <MOUNT/ROLE>    OpenBao role that signs SSH certificates
+                                    (or ssh_cert_role in the global config);
+                                    projects choose it in the SSH setup screen
+    --ssh-cert-host <[USER@]HOST>   One-off: use a signed certificate for this
+                                    launch, limited to these destinations
+                                    (repeatable; needs a known_hosts entry and
+                                    --network). Ignored if the project has its
+                                    own SSH choice
+    --ssh-cert-ttl <SECONDS>        Lifetime for --ssh-cert-host, 60-86400
+                                    (default 3600)
     --inherit-env / --no-inherit-env
                                     Inherit the full host environment (default: off —
                                     only a safe allowlist is passed)

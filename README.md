@@ -627,20 +627,22 @@ your shell, never into config.
 
 ### Vault-backed secrets: `--secret-provider`
 
-`--secret-provider` resolves bare `--env NAME` entries from a self-hosted
-vault (1Password Connect or OpenBao) instead of the local shell
-environment. The fetch happens on the host, before the sandbox starts,
+Requested variables listed in `secret_refs` are resolved from a
+self-hosted vault (1Password Connect or OpenBao) instead of the local shell
+environment: bare `--env NAME` entries, and names approved in the setup
+screen's environment picker (shown there as `(OpenBao)`). The fetch
+happens on the host, before the sandbox starts,
 and splices the values in as explicit `NAME=VALUE` entries, so `--secret`
 phantomization and `--env` ordering keep working unchanged.
 
 Resolution per requested key:
 
-| Situation                             | Result                                                                      |
-| ------------------------------------- | --------------------------------------------------------------------------- |
-| `--secret-provider` off (default)     | bare `NAME` copies the local host value (unchanged behavior)                |
-| flag on, provider type or URL missing | launch fails (set both via CLI flags or global config)                      |
-| `NAME` not in `secret_refs`           | copies the local host value                                                 |
-| `NAME` in `secret_refs`               | fetched from the provider; any failure stops the launch — no local fallback |
+| Situation                                        | Result                                                                      |
+| ------------------------------------------------ | --------------------------------------------------------------------------- |
+| `NAME` not in `secret_refs`                      | copies the local host value                                                 |
+| `NAME` in `secret_refs`                          | fetched from the provider; any failure stops the launch — no local fallback |
+| `NAME` in `secret_refs`, provider type/URL unset | launch fails (set both via CLI flags or global config)                      |
+| `--secret-provider` with provider type/URL unset | launch fails, even when nothing is requested                                |
 
 Configure the backend in trusted config (global
 `~/.config/ai-jail/config.toml`, or a project listed in
@@ -658,8 +660,10 @@ ANTHROPIC_API_KEY = "Dev/Anthropic/credential"  # 1Password: Vault/Item/field
 OPENAI_API_KEY = "secret/ai/openai#api_key"     # OpenBao: mount/path#field
 ```
 
-Then launch with `ai-jail --secret-provider --env ANTHROPIC_API_KEY --env
-OPENAI_API_KEY claude`. `secret_refs` is an allowlist: a bare `--env
+Then launch with `ai-jail --env ANTHROPIC_API_KEY --env OPENAI_API_KEY
+claude`, or approve those names once in `ai-jail configure claude`.
+`--secret-provider` is optional; it only makes a missing provider an
+error. `secret_refs` is an allowlist: a bare `--env
 NAME` whose name is absent from it still copies the local value.
 `--secret-ref KEY=REF` (repeatable, trusted config/CLI only) overrides a
 `secret_refs` config entry for one launch.
@@ -708,17 +712,23 @@ certificate instead of a long-lived key:
    same URL, CA and `AI_JAIL_SECRET_TOKEN` as above) and gets back a
    certificate.
 3. It loads key and certificate into the selected-key SSH agent, bounded
-   by `ssh_cert_ttl` and the `ssh_cert_hosts` destinations, and deletes
-   the key file. The jail only sees the agent socket.
+   by the project's lifetime and destinations, and deletes the key file.
+   The jail only sees the agent socket.
 
 ```toml
 # ~/.config/ai-jail/config.toml
 secrets_provider_type = "openbao"
 secrets_provider_url = "https://bao.example.com"
 ssh_cert_role = "ssh/ai-agent"             # mount/role
-ssh_cert_hosts = ["git@git.example.com", "admin@server.example.com"]
-ssh_cert_ttl = 3600                        # seconds, 60-86400 (default 3600)
 ```
+
+Each project then opts in from the setup screen (`ai-jail configure
+HARNESS`): in the SSH editor, select `OpenBao certificate (ssh/ai-agent)`
+and add the destinations (`[user@]host`) and lifetime, exactly like
+selected keys. A project that never selects it gets no certificate. For a
+one-off launch without saving anything, pass `--ssh-cert-host
+git@git.example.com` (repeatable) and optionally `--ssh-cert-ttl 600`;
+they are ignored when the project has its own SSH choice.
 
 `ssh_cert_role` names the OpenBao role that signs, as `mount/role`
 (`ssh/ai-agent` is role `ai-agent` on the `ssh` mount). The role decides
@@ -727,9 +737,9 @@ lifetime. Two independent limits apply:
 
 - **Principals** (in the certificate, checked by the server): who you may
   log in as.
-- **`ssh_cert_hosts`** (in the agent, checked on the host): where the
-  key may be used at all. Each entry needs a verified host key in
-  `~/.ssh/known_hosts` under its plain host name.
+- **Destinations** (in the agent, checked on the host): where the key may
+  be used at all. Each needs a verified host key in `~/.ssh/known_hosts`
+  under its plain host name.
 
 One-time OpenBao setup:
 
@@ -764,9 +774,8 @@ Inside the jail, git uses the agent automatically; direct ssh is
 your `~/.ssh/config`, so pass non-standard ports explicitly (`-p 2222`,
 or `ssh://git@host:2222/owner/repo.git` for git remotes).
 
-Like selected-key SSH, this needs unrestricted network (`--network`);
-without it the role is skipped quietly (`--verbose` says why). A
-project's own selected keys win over the global role. The certificate is
+Like selected-key SSH, this needs unrestricted network (`--network`). The
+certificate is
 signed once per launch, so a session longer than the lifetime loses SSH
 until the next launch. Because the agent holds only the signed key, the
 generated ssh config uses `IdentitiesOnly no` in this mode.

@@ -265,6 +265,12 @@ pub(crate) struct Selection {
     pub requested_secrets: std::collections::BTreeMap<String, String>,
     pub restricted_ssh: Option<crate::ssh_restricted::Policy>,
     pub additional: AdditionalSelection,
+    /// Global OpenBao SSH signing role, offered as an identity in the SSH
+    /// editor. Display context, not a grant.
+    pub openbao_ssh_role: Option<String>,
+    /// Names the trusted config fetches from the vault (`secret_refs`),
+    /// offered in the environment picker. Display context, not a grant.
+    pub vault_env_names: Vec<String>,
 }
 
 impl Selection {
@@ -295,6 +301,8 @@ impl Selection {
             requested_secrets: std::collections::BTreeMap::new(),
             restricted_ssh: None,
             additional: AdditionalSelection::from_config(config),
+            openbao_ssh_role: None,
+            vault_env_names: Vec::new(),
         }
     }
 
@@ -329,6 +337,8 @@ impl Selection {
             requested_secrets: config.secret_hosts.clone(),
             restricted_ssh: restricted_ssh.cloned(),
             additional: AdditionalSelection::from_config(config),
+            openbao_ssh_role: None,
+            vault_env_names: Vec::new(),
         }
     }
 
@@ -444,6 +454,9 @@ pub(crate) fn prepare_profile(
     project: &Path,
     approved_wrapper_requests: &[crate::integration::RequestApproval],
     effective: &EffectiveContext<'_>,
+    // Save without launching: render the preview like a dry run, so saving
+    // never fetches vault secrets or mints tokens.
+    preview_only: bool,
 ) -> Result<PreparedProfile, String> {
     let mut proposed = selection.profile_for(harnesses);
     proposed.approved_wrapper_requests = approved_wrapper_requests.to_vec();
@@ -451,7 +464,11 @@ pub(crate) fn prepare_profile(
         &proposed.grants,
         effective.store.policy_root(),
     )?;
-    crate::materialize_approved_env_names(&proposed.approved_env_names, false)?;
+    crate::materialize_approved_env_names(
+        &proposed.approved_env_names,
+        effective.global,
+        false,
+    )?;
     let base = crate::build_onboarding_effective(
         effective.global.clone(),
         proposed.grants.clone(),
@@ -463,13 +480,12 @@ pub(crate) fn prepare_profile(
     let mut finalized = crate::finalize_launch_config_with_ssh(
         base,
         project,
-        effective.cli.dry_run,
+        effective.cli.dry_run || preview_only,
         if effective.cli.ssh == Some(false) {
             None
         } else {
             proposed.restricted_ssh.clone()
         },
-        None,
     )?;
     let forge_preview =
         if effective.cli.clean || finalized.config.lockdown_enabled() {
@@ -1126,6 +1142,14 @@ pub(crate) fn run(
         effective.restricted_ssh,
         use_recommended_defaults,
     );
+    selection.openbao_ssh_role = effective.global.ssh_cert_role.clone();
+    selection.vault_env_names = effective
+        .global
+        .secret_refs
+        .keys()
+        .filter(|name| vault_env_name(effective.global, name))
+        .cloned()
+        .collect();
     let harnesses = if effective.cli.harnesses.is_empty() {
         vec![harness.to_string()]
     } else {
@@ -1164,9 +1188,15 @@ pub(crate) fn run(
             profile_path: &effective.store.project,
             policy_root,
         },
-        |current, approved| {
+        |current, approved, preview_only| {
             prepare_profile(
-                current, harness, &harnesses, project, approved, &effective,
+                current,
+                harness,
+                &harnesses,
+                project,
+                approved,
+                &effective,
+                preview_only,
             )
         },
     )
@@ -1557,7 +1587,11 @@ fn run_sequential(
         &proposed.grants,
         effective.store.policy_root(),
     )?;
-    crate::materialize_approved_env_names(&proposed.approved_env_names, false)?;
+    crate::materialize_approved_env_names(
+        &proposed.approved_env_names,
+        effective.global,
+        false,
+    )?;
     let base = crate::build_onboarding_effective(
         effective.global.clone(),
         proposed.grants.clone(),
@@ -1569,13 +1603,12 @@ fn run_sequential(
     let finalized = crate::finalize_launch_config_with_ssh(
         base,
         project,
-        effective.cli.dry_run,
+        effective.cli.dry_run || configure_only,
         if effective.cli.ssh == Some(false) {
             None
         } else {
             proposed.restricted_ssh.clone()
         },
-        None,
     )?;
     eprintln!(
         "{}",
@@ -1675,6 +1708,7 @@ fn edit_restricted_ssh(selection: &mut Selection) -> Result<(), String> {
                     crate::ssh_restricted::capture_key(Path::new(&choice))
                 })?;
             let mut policy = selection.restricted_ssh.take().unwrap_or(crate::ssh_restricted::Policy {
+                openbao_cert: false,
                 keys: Vec::new(),
                 lifetime_seconds: crate::ssh_restricted::DEFAULT_LIFETIME_SECONDS,
                 destinations: Vec::new(),
@@ -1941,9 +1975,43 @@ pub(crate) fn environment_name_catalog(selection: &Selection) -> Vec<String> {
         .filter(|name| !crate::config::env_inherited_by_default(name))
         .collect::<Vec<_>>();
     names.extend(selection.env_names.iter().cloned());
+    names.extend(selection.vault_env_names.iter().cloned());
     names.sort();
     names.dedup();
     names
+}
+
+/// Whether `name` is fetched from the vault: listed in the trusted
+/// `secret_refs` with a secret-provider URL configured.
+pub(crate) fn vault_env_name(global: &Config, name: &str) -> bool {
+    global.secrets_provider_url.is_some()
+        && global.secret_refs.contains_key(name)
+}
+
+/// Disclosure for a variable whose value comes from the vault, not the host.
+pub(crate) fn vault_env_grant(name: &str, harness: &str) -> GrantSpec {
+    GrantSpec {
+        resource: format!(
+            "Vault secret {} from the secret provider (value hidden)",
+            escape_control_bytes(name)
+        ),
+        access: "Fetched on the host at each launch; the value is never displayed or saved by ai-jail".into(),
+        scope: "This exact variable name, as listed in secret_refs; the launch fails if the fetch fails".into(),
+        ..env_grant(name, harness)
+    }
+}
+
+/// [`prepare_env_candidate`], except vault names need no host value.
+pub(crate) fn prepare_env_candidate_in(
+    selection: &Selection,
+    name: &str,
+    harness: &str,
+) -> Result<GrantSpec, String> {
+    if selection.vault_env_names.iter().any(|vault| vault == name) {
+        validate_env_name(name)?;
+        return Ok(vault_env_grant(name, harness));
+    }
+    prepare_env_candidate(name, harness)
 }
 
 pub(crate) fn prepare_env_candidate(
@@ -2058,13 +2126,7 @@ fn edit_environment(
         );
         return Ok(());
     }
-    if std::env::var_os(&name).is_none() {
-        return Err(format!(
-            "Host variable {} is not currently set; no approval was added",
-            escape_control_bytes(&name)
-        ));
-    }
-    let grant = env_grant(&name, harness);
+    let grant = prepare_env_candidate_in(selection, &name, harness)?;
     eprintln!("\n{}\n", grant.render());
     let approved = if grant.risk == Risk::Open {
         open_confirmation(&prompt(&format!(
@@ -2949,6 +3011,29 @@ mod tests {
     }
 
     #[test]
+    fn vault_names_need_no_host_value() {
+        let name = "AI_JAIL_TEST_VAULT_ONLY_7F3A";
+        assert!(std::env::var_os(name).is_none());
+        let selection = Selection {
+            vault_env_names: vec![name.into()],
+            ..Selection::default()
+        };
+        let grant =
+            prepare_env_candidate_in(&selection, name, "claude").unwrap();
+        assert!(grant.resource.contains("Vault secret"));
+        assert!(
+            prepare_env_candidate_in(&Selection::default(), name, "claude")
+                .is_err()
+        );
+
+        let mut global = Config::default();
+        global.secret_refs.insert(name.into(), "secret/ai#k".into());
+        assert!(!vault_env_name(&global, name), "no provider URL");
+        global.secrets_provider_url = Some("https://bao.example".into());
+        assert!(vault_env_name(&global, name));
+    }
+
+    #[test]
     fn review_classifies_exact_forge_authority_and_gates_open() {
         let base = std::env::temp_dir()
             .join(format!("ai-jail-review-forge-{}", std::process::id()));
@@ -2993,6 +3078,7 @@ mod tests {
             &project,
             &[],
             &context,
+            false,
         )
         .unwrap();
         assert!(open.display.has_open_authority);
@@ -3007,6 +3093,7 @@ mod tests {
             &project,
             &[],
             &context,
+            false,
         )
         .unwrap();
         assert!(!scoped.display.has_open_authority);
@@ -3047,6 +3134,7 @@ mod tests {
             &project,
             &[],
             &context,
+            false,
         )
         .unwrap();
         selection.github = true;
@@ -3057,6 +3145,7 @@ mod tests {
             &project,
             &[],
             &context,
+            false,
         )
         .unwrap();
 
@@ -3556,6 +3645,7 @@ mod tests {
     #[test]
     fn restricted_ssh_disclosure_names_scope_and_private_key_boundary() {
         let policy = crate::ssh_restricted::Policy {
+            openbao_cert: false,
             keys: vec![crate::ssh_restricted::KeyIdentity {
                 private_path: "/home/test/.ssh/id_test".into(),
                 public_path: "/home/test/.ssh/id_test.pub".into(),
@@ -3612,6 +3702,7 @@ mod tests {
     fn restricted_ssh_does_not_pretend_filtered_http_egress_carries_ssh() {
         let selection = Selection {
             restricted_ssh: Some(crate::ssh_restricted::Policy {
+                openbao_cert: false,
                 keys: Vec::new(),
                 lifetime_seconds: 600,
                 destinations: vec!["git@github.com".into()],

@@ -1452,8 +1452,6 @@ enum StaticRenderer {
     SecretProviderUrl,
     SecretProviderCa,
     SshCertRole,
-    SshCertHosts,
-    SshCertTtl,
     TrustedProjects,
 }
 
@@ -1587,8 +1585,6 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     static_policy!("secrets_provider_url", Authority, SecretProviderUrl),
     static_policy!("secrets_provider_ca", Authority, SecretProviderCa),
     static_policy!("ssh_cert_role", Authority, SshCertRole),
-    static_policy!("ssh_cert_hosts", Authority, SshCertHosts),
-    static_policy!("ssh_cert_ttl", Authority, SshCertTtl),
     static_policy!("trust_project_config", Authority, TrustedProjects),
     directional_policy!("update_check", UpdateCheck, "update-check-network"),
     directional_policy!("audit_log", AuditLog, "audit-log-host-write"),
@@ -1866,18 +1862,6 @@ fn render_static_authority(
             .iter()
             .filter(|v| baseline.ssh_cert_role.as_ref() != Some(*v))
             .map(|v| format!("ssh-cert-role {v}"))
-            .collect(),
-        StaticRenderer::SshCertHosts => config
-            .ssh_cert_hosts
-            .iter()
-            .filter(|v| !baseline.ssh_cert_hosts.contains(v))
-            .map(|v| format!("ssh-cert-host {v}"))
-            .collect(),
-        StaticRenderer::SshCertTtl => config
-            .ssh_cert_ttl
-            .iter()
-            .filter(|v| baseline.ssh_cert_ttl.as_ref() != Some(*v))
-            .map(|v| format!("ssh-cert-ttl {v}"))
             .collect(),
         StaticRenderer::TrustedProjects => added_paths(
             &config.trust_project_config,
@@ -2450,18 +2434,6 @@ mod tests {
             ["ssh-cert-role ssh/ai"]
         ),
         expected_authority!(
-            "ssh_cert_hosts",
-            Authority,
-            SshCertHosts,
-            ["ssh-cert-host git@example.com"]
-        ),
-        expected_authority!(
-            "ssh_cert_ttl",
-            Authority,
-            SshCertTtl,
-            ["ssh-cert-ttl 600"]
-        ),
-        expected_authority!(
             "trust_project_config",
             Authority,
             TrustedProjects,
@@ -2539,10 +2511,6 @@ mod tests {
                 config.secrets_provider_ca = Some("/outside/ca.pem".into());
             }
             "ssh_cert_role" => config.ssh_cert_role = Some("ssh/ai".into()),
-            "ssh_cert_hosts" => {
-                config.ssh_cert_hosts = vec!["git@example.com".into()];
-            }
-            "ssh_cert_ttl" => config.ssh_cert_ttl = Some(600),
             "trust_project_config" => {
                 config.trust_project_config = vec!["/outside/trusted".into()];
             }
@@ -3491,6 +3459,7 @@ mod tests {
             approved_env_names: Vec::new(),
             approved_wrapper_requests: Vec::new(),
             restricted_ssh: Some(crate::ssh_restricted::Policy {
+                openbao_cert: false,
                 keys: vec![crate::ssh_restricted::KeyIdentity {
                     private_path: "/home/test/.ssh/id_test".into(),
                     public_path: "/home/test/.ssh/id_test.pub".into(),

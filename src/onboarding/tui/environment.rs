@@ -43,6 +43,8 @@ pub(super) enum EnvironmentAction {
 pub(super) struct EnvironmentSelector {
     names: Vec<String>,
     approved: BTreeSet<String>,
+    /// Names fetched from the vault instead of the host environment.
+    vault: BTreeSet<String>,
     selected: usize,
     search: String,
     focus: Focus,
@@ -64,6 +66,7 @@ impl EnvironmentSelector {
         Self {
             names,
             approved: approved.into_iter().collect(),
+            vault: BTreeSet::new(),
             selected: 0,
             search: String::new(),
             focus: Focus::List,
@@ -74,6 +77,15 @@ impl EnvironmentSelector {
             required_detail_scroll: Cell::new(0),
             detail_geometry_ready: Cell::new(true),
         }
+    }
+
+    /// Mark names whose value comes from the vault (shown as `(OpenBao)`).
+    pub(super) fn with_vault(
+        mut self,
+        vault: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.vault = vault.into_iter().collect();
+        self
     }
 
     pub(super) fn set_error(&mut self, message: String) {
@@ -353,10 +365,21 @@ pub(super) fn render(
                 },
             )
         };
-        ListItem::new(Line::from(vec![
+        let mut line = vec![
             Span::styled(format!("{marker} "), marker_style),
             Span::raw((*name).clone()),
-        ]))
+        ];
+        if state.vault.contains(*name) {
+            line.push(Span::styled(
+                " (OpenBao)",
+                if use_color {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                },
+            ));
+        }
+        ListItem::new(Line::from(line))
     });
     let selected = if visible.is_empty() {
         None
@@ -475,6 +498,18 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn vault_names_are_marked_openbao() {
+        let state = EnvironmentSelector::new(
+            vec!["HOST_VAR".into(), "VAULT_KEY".into()],
+            Vec::<String>::new(),
+        )
+        .with_vault(["VAULT_KEY".to_string()]);
+        let text = rendered(&state);
+        assert!(text.contains("VAULT_KEY (OpenBao)"), "{text}");
+        assert!(!text.contains("HOST_VAR (OpenBao)"), "{text}");
     }
 
     #[test]

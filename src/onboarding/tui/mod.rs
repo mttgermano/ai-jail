@@ -42,6 +42,7 @@ where
     F: FnMut(
         &Selection,
         &[crate::integration::RequestApproval],
+        bool,
     ) -> Result<PreparedProfile, String>,
 {
     let project_path = project.to_path_buf();
@@ -82,6 +83,7 @@ where
             Transition::PrepareSave { save_only } => match prepare_profile(
                 app.selection,
                 &app.approved_wrapper_requests,
+                options.configure_only || save_only,
             ) {
                 Ok(draft) => {
                     return Ok(if options.configure_only || save_only {

@@ -81,6 +81,10 @@ pub(crate) struct Policy {
     pub(crate) lifetime_seconds: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) destinations: Vec<String>,
+    /// Use a key signed per launch by the global OpenBao `ssh_cert_role`
+    /// instead of `keys` (which must then be empty).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) openbao_cert: bool,
 }
 
 fn default_lifetime() -> u32 {
@@ -428,6 +432,14 @@ fn validate_presented_key(path: &Path, kind: &str) -> Result<(), String> {
 }
 
 pub(crate) fn validate_policy(policy: &Policy) -> Result<(), String> {
+    if policy.openbao_cert {
+        if !policy.keys.is_empty() {
+            return Err("An OpenBao SSH certificate replaces selected keys; \
+                 choose one or the other"
+                .into());
+        }
+        return validate_limits(policy);
+    }
     if policy.keys.is_empty() {
         return Err("Restricted SSH has no selected key".into());
     }
@@ -491,22 +503,16 @@ pub(crate) fn plan(
     plan_validated(policy, config, home)
 }
 
-/// Certificate mode: the launch generates a key, `signer` certifies it, and
-/// the agent holds only that key, bounded by `lifetime_seconds` and
-/// `destinations` exactly like selected keys.
+/// Certificate mode (`policy.openbao_cert`): the launch generates a key,
+/// `signer` certifies it, and the agent holds only that key, bounded by the
+/// policy's lifetime and destinations exactly like selected keys.
 pub(crate) fn plan_cert(
     signer: CertSigner,
-    lifetime_seconds: u32,
-    destinations: Vec<String>,
+    policy: Policy,
     config: &mut Config,
     home: &Path,
 ) -> Result<Plan, String> {
-    let policy = Policy {
-        keys: Vec::new(),
-        lifetime_seconds,
-        destinations,
-    };
-    validate_limits(&policy)?;
+    validate_policy(&policy)?;
     let mut plan = plan_validated(policy, config, home)?;
     plan.cert = Some(signer);
     Ok(plan)
@@ -702,11 +708,7 @@ fn collect_known_hosts_with(
 
 impl Plan {
     pub(crate) fn start(&self) -> Result<Runtime, String> {
-        if self.cert.is_some() {
-            validate_limits(&self.policy)?;
-        } else {
-            validate_policy(&self.policy)?;
-        }
+        validate_policy(&self.policy)?;
         self.start_validated()
     }
 
@@ -1120,6 +1122,7 @@ mod tests {
             ..Config::default()
         };
         let policy = Policy {
+            openbao_cert: false,
             keys: vec![key],
             lifetime_seconds: 600,
             destinations: vec![],
@@ -1178,6 +1181,7 @@ mod tests {
         let tools = Toolset::fixture(&root);
         let mut plan = plan_validated_with_tools(
             Policy {
+                openbao_cert: false,
                 keys: vec![key],
                 lifetime_seconds: 600,
                 destinations: vec![],
@@ -1243,6 +1247,7 @@ mod tests {
         }));
         let mut plan = plan_validated_with_tools(
             Policy {
+                openbao_cert: false,
                 keys: vec![],
                 lifetime_seconds: 600,
                 destinations: vec![],
@@ -1274,9 +1279,10 @@ mod tests {
         // The generated key and certificate do not outlive the load.
         assert!(!plan.base.join("id").exists());
         assert!(!plan.base.join("id-cert.pub").exists());
-        // Without a key, only certificate mode may start.
+        // Without a key, only certificate mode validates.
         assert!(validate_policy(&plan.policy).is_err());
-        assert!(validate_limits(&plan.policy).is_ok());
+        plan.policy.openbao_cert = true;
+        assert!(validate_policy(&plan.policy).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1301,6 +1307,7 @@ mod tests {
         let tools = Toolset::fixture(&root);
         let mut plan = plan_validated_with_tools(
             Policy {
+                openbao_cert: false,
                 keys: vec![key],
                 lifetime_seconds: 600,
                 destinations: vec![],
@@ -1492,6 +1499,7 @@ mod tests {
     #[test]
     fn unconstrained_selected_key_policy_is_refused() {
         let policy = Policy {
+            openbao_cert: false,
             keys: vec![KeyIdentity {
                 private_path: "/unused/private".into(),
                 public_path: "/unused/public".into(),
