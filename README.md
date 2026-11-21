@@ -769,9 +769,11 @@ key>` in `[server]` of `app.ini`, restart, and add the principal under
   Settings → SSH / GPG Keys → Manage SSH Principals. The certificate then
   acts as that account.
 
-Inside the jail, git uses the agent automatically; direct ssh is
-`"$AI_JAIL_SSH" -F "$AI_JAIL_SSH_CONFIG" host`. The jail does not see
-your `~/.ssh/config`, so pass non-standard ports explicitly (`-p 2222`,
+Inside the jail, git uses the agent automatically, and on Linux plain
+`ssh host` works too: the generated strict config is mounted read-only as
+the jail's `~/.ssh/config` (on macOS use `"$AI_JAIL_SSH" -F
+"$AI_JAIL_SSH_CONFIG" host`). The jail does not see your own
+`~/.ssh/config`, so pass non-standard ports explicitly (`-p 2222`,
 or `ssh://git@host:2222/owner/repo.git` for git remotes).
 
 Like selected-key SSH, this needs unrestricted network (`--network`). The

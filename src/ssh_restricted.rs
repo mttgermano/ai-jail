@@ -56,6 +56,7 @@ pub(crate) fn is_runtime_map(config: &Config, encoded: &Path) -> bool {
     base.is_some_and(|base| {
         candidate.source == base.join("agent.sock")
             || candidate.source == base.join("public")
+            || candidate.source == base.join("public/config")
     })
 }
 
@@ -565,6 +566,14 @@ fn plan_validated_with_tools(
         config.ro_maps.push(PathBuf::from(format!(
             "{}:{JAIL_PUBLIC_DIR}",
             public_dir.display()
+        )));
+        // The same generated config as the jail's ~/.ssh/config, so plain
+        // `ssh host` uses the fresh agent and the verified host keys without
+        // `-F`. Only this generated file is mounted; the host ~/.ssh is not.
+        config.ro_maps.push(PathBuf::from(format!(
+            "{}:{}",
+            public_dir.join("config").display(),
+            home.join(".ssh/config").display()
         )));
         config.env_pass.push(format!(
             "GIT_SSH_COMMAND={} -F {JAIL_PUBLIC_DIR}/config",
@@ -1144,6 +1153,20 @@ mod tests {
                 .any(|v| v.to_string_lossy().contains(JAIL_AGENT_SOCKET))
         );
         assert!(!config.ro_maps.iter().any(|v| v == &private));
+        #[cfg(target_os = "linux")]
+        {
+            let ssh_config = config
+                .ro_maps
+                .iter()
+                .find(|v| v.to_string_lossy().ends_with("/.ssh/config"))
+                .expect("generated config mounted as ~/.ssh/config")
+                .clone();
+            assert!(ssh_config.to_string_lossy().starts_with(&format!(
+                "{}:",
+                planned.public_dir.join("config").display()
+            )));
+            assert!(is_runtime_map(&config, &ssh_config));
+        }
         assert_eq!(planned.policy.lifetime_seconds, 600);
         fs::remove_dir_all(root).unwrap();
     }

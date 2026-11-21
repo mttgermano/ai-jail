@@ -397,14 +397,17 @@ unconstrained policy, or identity drift refuses the launch.
 Native SSH does not pass through ai-jail's HTTP CONNECT proxy. Selected-key SSH
 therefore also requires a separately reviewed Unrestricted network grant,
 classified OPEN. This opens reachability without adding identities to the fresh
-agent. Git uses the generated strict configuration. For direct SSH on Linux or
-macOS, use the launch-scoped variables:
+agent. Git uses the generated strict configuration. On Linux the same
+configuration is also mounted read-only as the jail's `~/.ssh/config`, so plain
+`ssh git@github.com` works. On macOS, or to be explicit, use the launch-scoped
+variables:
 
 ```sh
 "$AI_JAIL_SSH" -F "$AI_JAIL_SSH_CONFIG" git@github.com
 ```
 
-Plain `ssh` does not promise the selected-key restrictions. The temporary agent
+Only that generated file appears in the jail's `~/.ssh`; the host `~/.ssh`
+stays hidden. Destination limits are enforced by the agent either way. The temporary agent
 is killed and its generated public files are removed on normal exit, launch
 failure, and handled termination. `SIGKILL` cannot guarantee immediate
 cleanup; the configured `ssh-add` lifetime bounds use of keys left in a

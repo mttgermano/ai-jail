@@ -2172,12 +2172,21 @@ fn discover_ssh(
     private_home: bool,
     verbose: bool,
 ) -> (Vec<Mount>, Vec<(String, String)>) {
-    if lockdown || browser_mode || !config.ssh_enabled() {
+    // The launch-scoped (selected-key / OpenBao) agent needs the same tmpfs
+    // so plain `ssh` works with the generated ~/.ssh/config.
+    let restricted = config
+        .env_pass
+        .iter()
+        .any(|entry| crate::ssh_restricted::is_runtime_env(entry));
+    if lockdown || browser_mode || (!config.ssh_enabled() && !restricted) {
         return (vec![], vec![]);
     }
     let mut mounts = vec![Mount::Tmpfs {
         dest: "/etc/ssh/ssh_config.d".into(),
     }];
+    if !config.ssh_enabled() {
+        return (mounts, vec![]);
+    }
     let mut env = vec![];
     let ssh_dir = super::home_dir().join(".ssh");
     if private_home && ssh_dir.is_dir() {
@@ -4008,6 +4017,30 @@ mod tests {
             no_mise: Some(true),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn restricted_ssh_masks_system_ssh_config_d_only() {
+        let config = Config {
+            ssh: Some(false),
+            env_pass: vec![format!(
+                "SSH_AUTH_SOCK={}",
+                crate::ssh_restricted::JAIL_AGENT_SOCKET
+            )],
+            ..Config::default()
+        };
+        let (mounts, env) = discover_ssh(&config, false, false, true, false);
+        assert!(env.is_empty(), "host agent must not be exported");
+        assert_eq!(mounts.len(), 1);
+        assert!(matches!(
+            &mounts[0],
+            Mount::Tmpfs { dest } if dest == Path::new("/etc/ssh/ssh_config.d")
+        ));
+        let plain = Config {
+            ssh: Some(false),
+            ..Config::default()
+        };
+        assert!(discover_ssh(&plain, false, false, true, false).0.is_empty());
     }
 
     #[test]
